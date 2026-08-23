@@ -223,7 +223,7 @@ class TelegramBot:
             if isinstance(detail, dict) and "error" not in detail:
                 tf_lines.append(
                     f"  {tf}: EMA {detail.get('ema_cross', '?')} | "
-                    f"Price {'>' if detail.get('price_vs_ema21') == 'above' else '<'} EMA21 | "
+                    f"Price {'&gt;' if detail.get('price_vs_ema21') == 'above' else '&lt;'} EMA21 | "
                     f"Score: {detail.get('score', '?')}"
                 )
 
@@ -260,12 +260,12 @@ class TelegramBot:
             f"  Retest:   <code>[{retest_ok}]</code>\n"
         )
         if breakout.get("details"):
-            msg += f"  <code>{breakout['details']}</code>\n"
+            msg += f"  <code>{html.escape(str(breakout['details']))}</code>\n"
         lev = r.get("leverage")
         lev_line = f"\nLeverage: <code>{lev}x</code> (dynamic)" if lev else ""
         msg += (
-            f"\n<b>4. DECISION: {decision}</b>{lev_line}\n"
-            f"{reason}"
+            f"\n<b>4. DECISION: {html.escape(str(decision))}</b>{lev_line}\n"
+            f"{html.escape(str(reason))}"
         )
 
         self.send(msg)
@@ -274,7 +274,7 @@ class TelegramBot:
         self.notify_entry("long", level, level_type, price, quantity, sl, tp, 1)
 
     def notify_error(self, error: str):
-        self.send(f"<b>Error</b>\n<code>{error[:500]}</code>")
+        self.send(f"<b>Error</b>\n<code>{html.escape(str(error)[:500])}</code>")
 
     async def _cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not self._is_authorized(update):
