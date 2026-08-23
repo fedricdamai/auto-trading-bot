@@ -71,13 +71,21 @@ class TelegramBot:
         )
 
     def notify_levels(self, current_price: float, support: list, resistance: list):
-        sup = "\n".join(f"  {s:.2f}" for s in support[:5]) or "  none"
-        res = "\n".join(f"  {r:.2f}" for r in resistance[:5]) or "  none"
+        def _fmt(levels):
+            lines = []
+            for lv in levels[:5]:
+                if isinstance(lv, dict):
+                    tag = f" [Fib {lv['fib']}]" if lv.get("fib") else ""
+                    lines.append(f"  {lv['price']:.2f}{tag}")
+                else:
+                    lines.append(f"  {lv:.2f}")
+            return "\n".join(lines) or "  none"
+
         self.send(
             f"<b>Levels Update</b>\n"
             f"Price: <code>{current_price:.2f}</code>\n\n"
-            f"<b>Support (long zones):</b>\n<code>{sup}</code>\n\n"
-            f"<b>Resistance (short zones):</b>\n<code>{res}</code>"
+            f"<b>Support (long zones):</b>\n<code>{_fmt(support)}</code>\n\n"
+            f"<b>Resistance (short zones):</b>\n<code>{_fmt(resistance)}</code>"
         )
 
     def notify_entry(self, side: str, level: float, level_type: str, price: float,

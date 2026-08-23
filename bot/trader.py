@@ -135,20 +135,24 @@ class Trader:
             key=lambda l: abs(current_price - l.price),
         )
 
+        fib_count = sum(1 for l in levels if l.fib_ratio is not None)
         logger.info(
-            f"Levels refreshed: {len(support)} support, {len(resistance)} resistance | "
-            f"Price: {current_price:.2f}"
+            f"Levels refreshed: {len(support)} support, {len(resistance)} resistance, "
+            f"{fib_count} fibonacci | Price: {current_price:.2f}"
         )
-        for l in levels[:8]:
+        for l in levels[:10]:
             tfs = ",".join(l.timeframes) if l.timeframes else "-"
             dist = abs(current_price - l.price) / current_price * 100
-            logger.info(f"  {l.kind.upper():>10} {l.price:.2f} | str={l.strength} t={l.touches} [{tfs}] {dist:.1f}%")
+            fib_tag = f" Fib{l.fib_ratio}" if l.fib_ratio else ""
+            logger.info(f"  {l.kind.upper():>10} {l.price:.2f} | str={l.strength} t={l.touches} [{tfs}] {dist:.1f}%{fib_tag}")
 
         if self.notifier:
+            def _lv_info(l):
+                return {"price": l.price, "fib": l.fib_ratio}
             self.notifier.notify_levels(
                 current_price,
-                [l.price for l in support[:5]],
-                [l.price for l in resistance[:5]],
+                [_lv_info(l) for l in support[:5]],
+                [_lv_info(l) for l in resistance[:5]],
             )
 
         if self.pending_order and not self.position:
@@ -280,15 +284,19 @@ class Trader:
                 placed_at=time.time(),
             )
 
+            fib_tag = f" Fib{level.fib_ratio}" if level.fib_ratio else ""
             logger.info(
-                f"LIMIT {side.upper()} at {level.kind.upper()} {level.price:.2f} | "
+                f"LIMIT {side.upper()} at {level.kind.upper()} {level.price:.2f}{fib_tag} | "
                 f"Size: {order['amount']} | SL: {tpsl['sl_price']:.2f} | "
                 f"TP: {tpsl['tp_price']:.2f} | Strength: {effective_strength:.1f}"
             )
 
             if self.notifier:
+                level_label = level.kind
+                if level.fib_ratio:
+                    level_label = f"{level.kind} (Fib {level.fib_ratio})"
                 self.notifier.notify_limit_order(
-                    side, level.price, level.kind, order["amount"],
+                    side, level.price, level_label, order["amount"],
                     tpsl["sl_price"], tpsl["tp_price"], leverage, effective_strength,
                 )
 

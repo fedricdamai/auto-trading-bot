@@ -12,6 +12,7 @@ class Level:
     volume_avg: float
     last_touch_idx: int
     timeframes: list[str] | None = None
+    fib_ratio: float | None = None
 
 
 @dataclass
@@ -23,6 +24,14 @@ class DojiSignal:
 
 
 TF_WEIGHTS = {"1d": 1.5, "4h": 1.0, "1h": 0.6, "5m": 0.3}
+
+FIB_RATIOS = {
+    0.236: 30,
+    0.382: 35,
+    0.500: 40,
+    0.618: 45,
+    0.786: 38,
+}
 
 MULTI_TF_CONFIGS = [
     {"timeframe": "1d", "lookback": 120},
@@ -150,7 +159,62 @@ def _detect_from_df(
             timeframes=tfs,
         ))
 
+    fib_levels = _compute_fib_levels(highs, lows, closes, volumes, tolerance, n, tf_label)
+    for fib_lv in fib_levels:
+        duplicate = any(
+            abs(fib_lv.price - lv.price) / lv.price <= tolerance
+            for lv in levels
+        )
+        if not duplicate:
+            levels.append(fib_lv)
+
     levels.sort(key=lambda l: l.strength, reverse=True)
+    return levels
+
+
+def _compute_fib_levels(
+    highs: np.ndarray, lows: np.ndarray, closes: np.ndarray,
+    volumes: np.ndarray, tolerance: float, n: int, tf_label: str | None,
+) -> list[Level]:
+    highest = float(np.max(highs))
+    lowest = float(np.min(lows))
+    price_range = highest - lowest
+    if price_range <= 0:
+        return []
+
+    current_price = closes[-1]
+    tfs = [tf_label] if tf_label else None
+    levels = []
+
+    for ratio, base_strength in FIB_RATIOS.items():
+        fib_price = round(lowest + price_range * ratio, 2)
+
+        touches, vol_at_touches, last_touch, rejection_score = _analyze_level(
+            fib_price, highs, lows, closes, volumes, tolerance,
+        )
+
+        recency = max(0, 1 - (n - 1 - last_touch) / n) if last_touch >= 0 else 0
+
+        strength = (
+            base_strength
+            + min(touches / 4, 1.0) * 20
+            + recency * 15
+            + _volume_score(vol_at_touches, volumes) * 10
+        )
+
+        kind = "support" if fib_price < current_price else "resistance"
+
+        levels.append(Level(
+            price=fib_price,
+            kind=kind,
+            touches=touches,
+            strength=round(min(strength, 100), 1),
+            volume_avg=round(vol_at_touches, 2),
+            last_touch_idx=last_touch,
+            timeframes=tfs,
+            fib_ratio=ratio,
+        ))
+
     return levels
 
 
@@ -200,6 +264,8 @@ def _merge_multi_tf_levels(
         total_touches = sum(l.touches for l in lvs)
         strength = min(base_strength * (tf_bonus / len(tfs)) + confluence_bonus, 100)
 
+        fib = next((l.fib_ratio for l in lvs if l.fib_ratio is not None), None)
+
         result.append(Level(
             price=price,
             kind=best.kind,
@@ -208,6 +274,7 @@ def _merge_multi_tf_levels(
             volume_avg=round(max(l.volume_avg for l in lvs), 2),
             last_touch_idx=best.last_touch_idx,
             timeframes=sorted(tfs),
+            fib_ratio=fib,
         ))
 
     result.sort(key=lambda l: l.strength, reverse=True)
