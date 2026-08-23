@@ -232,9 +232,32 @@ class Trader:
 
     def _place_best_order(self, current_price: float):
         """Find the best level and place a single limit order there."""
+        position = self.exchange.get_position()
+        if position and position["size"] > 0:
+            logger.info(f"Already have {position['side']} position, skipping new order")
+            return
+
         best_level, best_strength = self._find_best_level(current_price)
         if not best_level:
             return
+
+        open_orders = self.exchange.get_open_orders()
+        if open_orders:
+            for o in open_orders:
+                existing_price = float(o.get("limitPx", 0))
+                if existing_price > 0:
+                    diff_pct = abs(best_level.price - existing_price) / existing_price * 100
+                    if diff_pct < 0.5:
+                        logger.info(
+                            f"Order already exists near {best_level.price:.2f} "
+                            f"(existing @ {existing_price:.2f}, diff {diff_pct:.2f}%), skipping"
+                        )
+                        return
+
+        cancelled = self.exchange.cancel_all_orders()
+        if cancelled:
+            logger.info(f"Cancelled {cancelled} stale orders before placing new one")
+
         self._place_limit_order(current_price, best_level, best_strength)
 
     def _place_limit_order(self, current_price: float, level: Level, effective_strength: float):
@@ -379,6 +402,16 @@ class Trader:
             f"{leverage}x lev"
         )
 
+        try:
+            self.exchange.place_tp_sl_orders(
+                quantity, side, tpsl["tp_price"], tpsl["sl_price"],
+            )
+            logger.info("TP/SL trigger orders placed on exchange")
+        except Exception as e:
+            logger.error(f"Failed to place TP/SL triggers: {e}")
+            if self.notifier:
+                self.notifier.notify_error(f"TP/SL trigger placement failed: {e}")
+
         if self.notifier:
             self.notifier.notify_entry(
                 side, level.price, level.kind, fill_price, quantity,
@@ -522,6 +555,10 @@ class Trader:
             price_pnl = (pos.entry_price - exit_price) / pos.entry_price * 100
 
         margin_pnl = price_pnl * leverage
+
+        cancelled = self.exchange.cancel_all_orders()
+        if cancelled:
+            logger.info(f"Cancelled {cancelled} orders (incl. TP/SL triggers) before closing")
 
         try:
             self.exchange.place_market_close(pos.quantity, side=pos.side)

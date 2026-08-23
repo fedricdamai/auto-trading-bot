@@ -334,6 +334,84 @@ class HyperliquidExchange:
         logger.info(f"[LIVE] Order cancelled: oid={oid}")
         return result
 
+    def cancel_all_orders(self) -> int:
+        """Cancel all open orders for the configured symbol. Returns count cancelled."""
+        if self.config.paper_trade:
+            return 0
+
+        orders = self.get_open_orders()
+        if not orders:
+            return 0
+
+        cancel_requests = [
+            {"coin": self.config.hl_symbol, "oid": int(o["oid"])}
+            for o in orders if o.get("oid") is not None
+        ]
+        if not cancel_requests:
+            return 0
+
+        try:
+            self.exchange.bulk_cancel(cancel_requests)
+            logger.info(f"[LIVE] Bulk cancelled {len(cancel_requests)} orders")
+        except Exception as e:
+            logger.error(f"Bulk cancel failed, cancelling individually: {e}")
+            for req in cancel_requests:
+                try:
+                    self.exchange.cancel(name=self.config.hl_symbol, oid=req["oid"])
+                except Exception as e2:
+                    logger.warning(f"Individual cancel oid={req['oid']} failed: {e2}")
+
+        return len(cancel_requests)
+
+    def place_tp_sl_orders(self, quantity: float, side: str, tp_price: float, sl_price: float) -> dict:
+        """Place TP and SL trigger orders on the exchange.
+
+        For long positions: TP = sell trigger, SL = sell trigger
+        For short positions: TP = buy trigger, SL = buy trigger
+        """
+        if self.config.paper_trade:
+            logger.info(f"[PAPER] TP/SL: TP={tp_price:.2f} SL={sl_price:.2f} for {side}")
+            return {"tp": "paper", "sl": "paper"}
+
+        is_buy_close = side == "short"
+        quantity = self._round_size(quantity)
+        tp_price = self._round_price(tp_price)
+        sl_price = self._round_price(sl_price)
+
+        results = {}
+
+        try:
+            tp_result = self.exchange.order(
+                name=self.config.hl_symbol,
+                is_buy=is_buy_close,
+                sz=quantity,
+                limit_px=tp_price,
+                order_type={"trigger": {"triggerPx": tp_price, "isMarket": True, "tpsl": "tp"}},
+                reduce_only=True,
+            )
+            results["tp"] = tp_result
+            logger.info(f"[LIVE] TP trigger placed: {tp_price:.2f} ({side})")
+        except Exception as e:
+            logger.error(f"Failed to place TP trigger at {tp_price}: {e}")
+            results["tp_error"] = str(e)
+
+        try:
+            sl_result = self.exchange.order(
+                name=self.config.hl_symbol,
+                is_buy=is_buy_close,
+                sz=quantity,
+                limit_px=sl_price,
+                order_type={"trigger": {"triggerPx": sl_price, "isMarket": True, "tpsl": "sl"}},
+                reduce_only=True,
+            )
+            results["sl"] = sl_result
+            logger.info(f"[LIVE] SL trigger placed: {sl_price:.2f} ({side})")
+        except Exception as e:
+            logger.error(f"Failed to place SL trigger at {sl_price}: {e}")
+            results["sl_error"] = str(e)
+
+        return results
+
     def place_market_sell(self, quantity: float) -> dict:
         return self.place_market_close(quantity, side="long")
 
