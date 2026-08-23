@@ -50,6 +50,13 @@ def main():
     logger.info(f"  Timeframe:   {config.timeframe}")
     if config.exchange_backend == "hyperliquid":
         logger.info(f"  Leverage:    {config.hl_leverage}x")
+        if config.hl_multi_symbol:
+            if config.hl_symbols:
+                logger.info(f"  Multi-sym:   ON ({config.hl_symbols})")
+            else:
+                logger.info(f"  Multi-sym:   ON (top {config.hl_scan_top_n} by volume)")
+        else:
+            logger.info(f"  Multi-sym:   OFF (single: {config.hl_symbol})")
     logger.info(f"  Order size:  {config.order_size} (quote)")
     logger.info(f"  Mode:        {mode}")
     logger.info(f"  Telegram:    {'ON' if config.telegram_enabled else 'OFF'}")

@@ -11,6 +11,7 @@ from bot.levels import (
 from bot.telegram_notifier import TelegramNotifier
 from bot.trade_journal import TradeJournal, TradeRecord
 from bot.strategy_learner import StrategyLearner
+from bot.scanner import MarketScanner, SymbolOpportunity
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +68,12 @@ class Trader:
         self.last_exit_time: float = 0
         self.last_trend_bias: TrendBias | None = None
         self._synced: bool = False
+        self.scanner: MarketScanner | None = None
+        self.last_scan_time: float = 0
+        self.scan_interval: int = 300
+
+        if config.hl_multi_symbol and hasattr(exchange, "info"):
+            self.scanner = MarketScanner(exchange.info, config)
 
         self.journal = TradeJournal()
         self.learner = StrategyLearner(self.journal)
@@ -316,18 +323,22 @@ class Trader:
     def _place_best_order(self, current_price: float):
         """Ensure exactly 1 limit order at the best S/R level.
 
-        Runs trend bias + breakout/fakeout analysis and sends a decision
-        report to Telegram before placing or skipping.
+        In multi-symbol mode, scans all markets first and switches to
+        the best opportunity. Runs trend bias + breakout/fakeout analysis
+        and sends a decision report to Telegram before placing or skipping.
         """
         position = self.exchange.get_position()
         if position and position["size"] > 0:
             return
 
+        if self.scanner and time.time() - self.last_scan_time >= self.scan_interval:
+            self._run_multi_symbol_scan(current_price)
+
         try:
             trend = compute_trend_bias(self.exchange)
             self.last_trend_bias = trend
             logger.info(
-                f"Trend bias: {trend.direction.upper()} ({trend.confidence:.0f}%)"
+                f"Trend bias [{self.config.hl_symbol}]: {trend.direction.upper()} ({trend.confidence:.0f}%)"
             )
         except Exception as e:
             logger.warning(f"Trend bias computation failed: {e}")
@@ -429,6 +440,55 @@ class Trader:
             logger.info(f"Cancelled {len(open_orders)} orders (stale/duplicate cleanup)")
 
         self._place_limit_order(current_price, best_level, best_strength)
+
+    def _run_multi_symbol_scan(self, current_price: float):
+        """Scan multiple markets and switch to the best opportunity."""
+        self.last_scan_time = time.time()
+
+        symbols = None
+        if self.config.hl_symbols:
+            symbols = [s.strip() for s in self.config.hl_symbols.split(",") if s.strip()]
+
+        logger.info(f"Scanning {'custom list' if symbols else f'top {self.config.hl_scan_top_n}'} markets...")
+        opportunities = self.scanner.scan_all(
+            symbols=symbols,
+            top_n=self.config.hl_scan_top_n,
+        )
+
+        if not opportunities:
+            logger.info("No opportunities found across scanned markets")
+            return
+
+        best = opportunities[0]
+
+        if best.symbol != self.config.hl_symbol:
+            open_orders = self.exchange.get_open_orders()
+            if open_orders:
+                self.exchange.cancel_all_orders()
+                self.pending_order = None
+                logger.info(f"Cancelled orders on {self.config.hl_symbol} for symbol switch")
+
+            self.exchange.switch_symbol(best.symbol)
+            self.known_levels = {}
+            self.last_level_refresh = 0
+
+        scan_summary = "\n".join(
+            f"  {i+1}. {o.symbol}: score={o.score:.1f} | {o.level.kind} @ {o.level.price:.2f} | "
+            f"trend={o.trend.direction} ({o.trend.confidence:.0f}%)"
+            for i, o in enumerate(opportunities[:5])
+        )
+        logger.info(f"Top opportunities:\n{scan_summary}")
+
+        if self.notifier:
+            lines = [f"<b>MARKET SCAN ({len(opportunities)} found)</b>\n"]
+            for i, o in enumerate(opportunities[:5]):
+                marker = " [ACTIVE]" if o.symbol == self.config.hl_symbol else ""
+                lines.append(
+                    f"{i+1}. <code>{o.symbol}</code> score={o.score:.1f}{marker}\n"
+                    f"   {o.level.kind} @ <code>{o.level.price:.2f}</code> | "
+                    f"trend: {o.trend.direction} ({o.trend.confidence:.0f}%)"
+                )
+            self.notifier.send("\n".join(lines))
 
     def _place_limit_order(self, current_price: float, level: Level, effective_strength: float):
         leverage = self.config.hl_leverage

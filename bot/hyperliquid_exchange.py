@@ -32,6 +32,17 @@ class HyperliquidExchange:
             self.exchange = HLExchange(account, base_url)
             self._set_leverage()
 
+    def switch_symbol(self, symbol: str):
+        """Switch to a different trading symbol (for multi-symbol scanning)."""
+        if symbol == self.config.hl_symbol:
+            return
+        old = self.config.hl_symbol
+        self.config.hl_symbol = symbol
+        self._sz_decimals = self._get_sz_decimals()
+        if self.exchange and not self.config.paper_trade:
+            self._set_leverage()
+        logger.info(f"Switched symbol: {old} -> {symbol} (szDec={self._sz_decimals})")
+
     def _get_sz_decimals(self) -> int:
         """Get size decimal places for the configured symbol from exchange metadata."""
         try:

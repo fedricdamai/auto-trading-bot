@@ -67,6 +67,7 @@ class TelegramBot:
             f"/levels - S/R levels (multi-TF)\n"
             f"/pnl - Position P&L\n"
             f"/risk - TP/SL & leverage info\n"
+            f"/scan - Scan all markets (multi-symbol)\n"
             f"/help - All commands"
         )
 
@@ -222,6 +223,8 @@ class TelegramBot:
             "/settp 1.5 - Set target profit %\n"
             "/setsl 0.5 - Set max loss %\n"
             "/setlev 3 - Set leverage (1-5)\n\n"
+            "<b>Multi-symbol:</b>\n"
+            "/scan - Scan all markets\n\n"
             "<b>Learning:</b>\n"
             "/learn - What the bot has learned\n"
             "/journal - Recent trade history\n\n"
@@ -284,8 +287,12 @@ class TelegramBot:
         else:
             pos_text = "\n\nNo open position — scanning for entry..."
 
+        symbol = self.trader.config.hl_symbol
+        multi = " (multi-sym)" if self.trader.config.hl_multi_symbol else ""
+
         await update.message.reply_text(
             f"<b>Bot Status [{mode}]</b>\n\n"
+            f"Symbol: <code>{symbol}</code>{multi}\n"
             f"Price: <code>{price:.2f}</code>\n"
             f"Levels tracked: <code>{levels}</code>\n"
             f"Pending orders: <code>{1 if pending else 0}</code>\n"
@@ -452,6 +459,45 @@ class TelegramBot:
 
         await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
+    async def _cmd_scan(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not self._is_authorized(update):
+            return
+        if not self.trader:
+            await update.message.reply_text("Bot not initialized yet.")
+            return
+        if not self.trader.scanner:
+            await update.message.reply_text("Multi-symbol mode is not enabled. Set HL_MULTI_SYMBOL=true.")
+            return
+
+        await update.message.reply_text("Scanning markets...")
+
+        try:
+            symbols = None
+            if self.trader.config.hl_symbols:
+                symbols = [s.strip() for s in self.trader.config.hl_symbols.split(",") if s.strip()]
+            opportunities = self.trader.scanner.scan_all(
+                symbols=symbols,
+                top_n=self.trader.config.hl_scan_top_n,
+            )
+
+            if not opportunities:
+                await update.message.reply_text("No opportunities found.")
+                return
+
+            lines = [f"<b>Market Scan Results ({len(opportunities)} found)</b>\n"]
+            for i, o in enumerate(opportunities[:10]):
+                active = " [ACTIVE]" if o.symbol == self.trader.config.hl_symbol else ""
+                lines.append(
+                    f"{i+1}. <b>{o.symbol}</b> — score: <code>{o.score:.1f}</code>{active}\n"
+                    f"   {o.level.kind} @ <code>{o.level.price:.2f}</code> (str={o.level.strength})\n"
+                    f"   Trend: {o.trend.direction} ({o.trend.confidence:.0f}%) | "
+                    f"Dist: {o.distance_pct:.2f}%"
+                )
+
+            await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+        except Exception as e:
+            await update.message.reply_text(f"Scan failed: {e}")
+
     async def _cmd_risk(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not self._is_authorized(update):
             return
@@ -614,6 +660,7 @@ class TelegramBot:
         app.add_handler(CommandHandler("setlev", self._cmd_setlev))
         app.add_handler(CommandHandler("learn", self._cmd_learn))
         app.add_handler(CommandHandler("journal", self._cmd_journal))
+        app.add_handler(CommandHandler("scan", self._cmd_scan))
 
         await app.initialize()
         await app.start()

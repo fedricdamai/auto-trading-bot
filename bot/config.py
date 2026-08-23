@@ -24,6 +24,11 @@ class Config:
     hl_max_leverage: int = int(os.getenv("HL_MAX_LEVERAGE", "5"))
     hl_mainnet: bool = os.getenv("HL_MAINNET", "false").lower() == "true"
 
+    # Multi-symbol scanning
+    hl_multi_symbol: bool = os.getenv("HL_MULTI_SYMBOL", "false").lower() == "true"
+    hl_symbols: str = os.getenv("HL_SYMBOLS", "")  # comma-separated, e.g. "BTC,ETH,SOL"
+    hl_scan_top_n: int = int(os.getenv("HL_SCAN_TOP_N", "10"))
+
     # Shared trading settings
     timeframe: str = os.getenv("TIMEFRAME", "5m")
     lookback_candles: int = int(os.getenv("LOOKBACK_CANDLES", "200"))
