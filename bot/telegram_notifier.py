@@ -170,8 +170,9 @@ class TelegramBot:
 
         fib_tag = f" (Fib {level.get('fib_ratio')})" if level.get("fib_ratio") else ""
 
+        symbol = r.get("symbol", "?")
         msg = (
-            f"<b>DECISION REPORT</b>\n"
+            f"<b>DECISION REPORT — {symbol}</b>\n"
             f"{'=' * 28}\n\n"
             f"<b>1. TRIGGER</b>\n"
             f"Level: <code>{level.get('price', '?')}</code> ({level.get('kind', '?')}{fib_tag})\n"
@@ -244,59 +245,71 @@ class TelegramBot:
             await update.message.reply_text("Bot not initialized yet.")
             return
 
-        try:
-            price = self.trader.exchange.get_ticker_price()
-        except Exception:
-            price = 0
-
-        levels = len(self.trader.known_levels)
         if self.trader.config.paper_trade:
             mode = "PAPER"
         else:
             mode = "LIVE MAINNET" if self.trader.config.hl_mainnet else "LIVE TESTNET"
 
-        pos = self.trader.position
-        pending = self.trader.pending_order
-        if pos:
-            lev = self.trader.config.hl_leverage
-            if pos.side == "long":
-                price_pnl = (price - pos.entry_price) / pos.entry_price * 100
-            else:
-                price_pnl = (pos.entry_price - price) / pos.entry_price * 100
-            margin_pnl = price_pnl * lev
-            sign = "+" if margin_pnl >= 0 else ""
+        total_levels = sum(len(v) for v in self.trader.known_levels.values())
+        positions = self.trader.positions
+        pending_orders = self.trader.pending_orders
+        lev = self.trader.config.hl_leverage
 
-            pos_text = (
-                f"\n\n<b>Position: {pos.side.upper()}</b>\n"
-                f"Entry: <code>{pos.entry_price:.2f}</code> ({pos.kind})\n"
-                f"Now: <code>{price:.2f}</code>\n"
-                f"Margin PnL: <code>{sign}{margin_pnl:.2f}%</code>\n"
-                f"SL: <code>{pos.stop_loss:.2f}</code> | TP: <code>{pos.take_profit:.2f}</code>"
-            )
-        elif pending:
-            label = "LIMIT BUY" if pending.side == "long" else "LIMIT SELL"
-            dist = abs(price - pending.price) / price * 100
-            pos_text = (
-                f"\n\n<b>Pending: {label}</b>\n"
-                f"Level: <code>{pending.level_price:.2f}</code> ({pending.kind})\n"
-                f"Price: <code>{pending.price:.2f}</code> ({dist:.2f}% away)\n"
-                f"Size: <code>{pending.quantity:.6f}</code>\n"
-                f"SL: <code>{pending.stop_loss:.2f}</code> | TP: <code>{pending.take_profit:.2f}</code>\n"
-                f"Confidence: <code>{pending.effective_strength:.1f}</code>"
-            )
-        else:
-            pos_text = "\n\nNo open position — scanning for entry..."
+        symbols_line = ", ".join(self.trader._get_symbols())
+        max_pos = self.trader.max_positions
 
-        symbol = self.trader.config.hl_symbol
-        multi = " (multi-sym)" if self.trader.config.hl_multi_symbol else ""
+        pos_text = ""
+        if positions:
+            pos_text += "\n"
+            for sym, pos in positions.items():
+                self.trader.exchange.switch_symbol(sym)
+                try:
+                    sym_price = self.trader.exchange.get_ticker_price()
+                except Exception:
+                    sym_price = 0
+                if pos.side == "long":
+                    price_pnl = (sym_price - pos.entry_price) / pos.entry_price * 100
+                else:
+                    price_pnl = (pos.entry_price - sym_price) / pos.entry_price * 100
+                margin_pnl = price_pnl * lev
+                sign = "+" if margin_pnl >= 0 else ""
+                pos_text += (
+                    f"\n<b>{sym} {pos.side.upper()}</b>\n"
+                    f"  Entry: <code>{pos.entry_price:.2f}</code> ({pos.kind})\n"
+                    f"  Now: <code>{sym_price:.2f}</code> | PnL: <code>{sign}{margin_pnl:.2f}%</code>\n"
+                    f"  SL: <code>{pos.stop_loss:.2f}</code> | TP: <code>{pos.take_profit:.2f}</code>"
+                )
+
+        if pending_orders:
+            pos_text += "\n"
+            for sym, pend in pending_orders.items():
+                self.trader.exchange.switch_symbol(sym)
+                try:
+                    sym_price = self.trader.exchange.get_ticker_price()
+                except Exception:
+                    sym_price = 0
+                label = "BUY" if pend.side == "long" else "SELL"
+                dist = abs(sym_price - pend.price) / sym_price * 100 if sym_price else 0
+                pos_text += (
+                    f"\n<b>{sym} LIMIT {label}</b>\n"
+                    f"  Level: <code>{pend.level_price:.2f}</code> ({pend.kind})\n"
+                    f"  Price: <code>{pend.price:.2f}</code> ({dist:.2f}% away)\n"
+                    f"  SL: <code>{pend.stop_loss:.2f}</code> | TP: <code>{pend.take_profit:.2f}</code>\n"
+                    f"  Str: <code>{pend.effective_strength:.1f}</code>"
+                )
+
+        if not positions and not pending_orders:
+            pos_text = "\n\nNo open positions — scanning for entries..."
+
+        self.trader.exchange.switch_symbol(self.trader.config.hl_symbol)
 
         await update.message.reply_text(
             f"<b>Bot Status [{mode}]</b>\n\n"
-            f"Symbol: <code>{symbol}</code>{multi}\n"
-            f"Price: <code>{price:.2f}</code>\n"
-            f"Levels tracked: <code>{levels}</code>\n"
-            f"Pending orders: <code>{1 if pending else 0}</code>\n"
-            f"Open positions: <code>{1 if pos else 0}</code>"
+            f"Symbols: <code>{symbols_line}</code>\n"
+            f"Leverage: <code>{lev}x</code>\n"
+            f"Levels tracked: <code>{total_levels}</code>\n"
+            f"Positions: <code>{len(positions)}/{max_pos}</code> | "
+            f"Pending: <code>{len(pending_orders)}</code>"
             f"{pos_text}",
             parse_mode=ParseMode.HTML,
         )
@@ -308,76 +321,91 @@ class TelegramBot:
             await update.message.reply_text("No levels detected yet. Wait for the next refresh.")
             return
 
-        try:
-            price = self.trader.exchange.get_ticker_price()
-        except Exception:
-            price = 0
+        lines = [f"<b>S/R Levels (Multi-TF)</b>\n"]
 
-        sorted_levels = sorted(self.trader.known_levels.values(), key=lambda l: l.strength, reverse=True)
-        support = [l for l in sorted_levels if l.kind == "support"]
-        resistance = [l for l in sorted_levels if l.kind == "resistance"]
+        for sym, sym_levels in self.trader.known_levels.items():
+            if not sym_levels:
+                continue
+            self.trader.exchange.switch_symbol(sym)
+            try:
+                price = self.trader.exchange.get_ticker_price()
+            except Exception:
+                price = 0
 
-        lines = [f"<b>S/R Levels (Multi-TF)</b>\nPrice: <code>{price:.2f}</code>\n"]
+            sorted_levels = sorted(sym_levels.values(), key=lambda l: l.strength, reverse=True)
+            support = [l for l in sorted_levels if l.kind == "support"]
+            resistance = [l for l in sorted_levels if l.kind == "resistance"]
 
-        if resistance:
-            lines.append("<b>Resistance (short zones):</b>")
-            for l in resistance[:5]:
-                dist = abs(l.price - price) / price * 100
-                tfs = ",".join(l.timeframes) if l.timeframes else "-"
-                lines.append(f"  <code>{l.price:.2f}</code> | str={l.strength} t={l.touches} [{tfs}] ({dist:.1f}%)")
+            lines.append(f"<b>{sym}</b> — <code>{price:.2f}</code>")
+            if resistance:
+                for l in resistance[:3]:
+                    dist = abs(l.price - price) / price * 100 if price else 0
+                    tfs = ",".join(l.timeframes) if l.timeframes else "-"
+                    lines.append(f"  R <code>{l.price:.2f}</code> str={l.strength} [{tfs}] ({dist:.1f}%)")
+            if support:
+                for l in support[:3]:
+                    dist = abs(l.price - price) / price * 100 if price else 0
+                    tfs = ",".join(l.timeframes) if l.timeframes else "-"
+                    lines.append(f"  S <code>{l.price:.2f}</code> str={l.strength} [{tfs}] ({dist:.1f}%)")
+            lines.append("")
 
-        if support:
-            lines.append("\n<b>Support (long zones):</b>")
-            for l in support[:5]:
-                dist = abs(l.price - price) / price * 100
-                tfs = ",".join(l.timeframes) if l.timeframes else "-"
-                lines.append(f"  <code>{l.price:.2f}</code> | str={l.strength} t={l.touches} [{tfs}] ({dist:.1f}%)")
-
+        self.trader.exchange.switch_symbol(self.trader.config.hl_symbol)
         await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
     async def _cmd_pnl(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not self._is_authorized(update):
             return
-        if not self.trader or not self.trader.position:
-            await update.message.reply_text("No open position.")
+        if not self.trader or not self.trader.positions:
+            await update.message.reply_text("No open positions.")
             return
 
-        try:
-            price = self.trader.exchange.get_ticker_price()
-        except Exception:
-            await update.message.reply_text("Could not fetch current price.")
-            return
-
-        pos = self.trader.position
+        import time as _time
         lev = self.trader.config.hl_leverage
+        lines = [f"<b>Open Positions PnL ({lev}x)</b>\n"]
+        total_pnl_usd = 0.0
 
-        if pos.side == "long":
-            price_pnl = (price - pos.entry_price) / pos.entry_price * 100
-            pnl_usd = pos.quantity * (price - pos.entry_price) * lev
-        else:
-            price_pnl = (pos.entry_price - price) / pos.entry_price * 100
-            pnl_usd = pos.quantity * (pos.entry_price - price) * lev
+        for sym, pos in self.trader.positions.items():
+            self.trader.exchange.switch_symbol(sym)
+            try:
+                price = self.trader.exchange.get_ticker_price()
+            except Exception:
+                lines.append(f"\n<b>{sym}</b> — price unavailable")
+                continue
 
-        margin_pnl = price_pnl * lev
-        sign = "+" if margin_pnl >= 0 else ""
+            if pos.side == "long":
+                price_pnl = (price - pos.entry_price) / pos.entry_price * 100
+                pnl_usd = pos.quantity * (price - pos.entry_price) * lev
+            else:
+                price_pnl = (pos.entry_price - price) / pos.entry_price * 100
+                pnl_usd = pos.quantity * (pos.entry_price - price) * lev
 
-        sl_moved = pos.stop_loss != pos.initial_sl
-        sl_tag = " (trailed)" if sl_moved else ""
-        tp_moved = pos.take_profit != pos.initial_tp
-        tp_tag = " (extended)" if tp_moved else ""
+            margin_pnl = price_pnl * lev
+            total_pnl_usd += pnl_usd
+            sign = "+" if margin_pnl >= 0 else ""
 
-        hold_h = ((__import__("time").time() - pos.filled_at) / 3600) if pos.filled_at else 0
+            sl_moved = pos.stop_loss != pos.initial_sl
+            sl_tag = " (trailed)" if sl_moved else ""
+            tp_moved = pos.take_profit != pos.initial_tp
+            tp_tag = " (extended)" if tp_moved else ""
 
-        await update.message.reply_text(
-            f"<b>{pos.side.upper()} Position ({lev}x)</b>\n\n"
-            f"Entry: <code>{pos.entry_price:.2f}</code> ({pos.kind})\n"
-            f"Now: <code>{price:.2f}</code>\n"
-            f"Margin PnL: <code>{sign}{margin_pnl:.2f}%</code> ({sign}{pnl_usd:.2f})\n"
-            f"SL: <code>{pos.stop_loss:.2f}</code>{sl_tag}\n"
-            f"TP: <code>{pos.take_profit:.2f}</code>{tp_tag}\n"
-            f"Hold time: <code>{hold_h:.1f}h</code>",
-            parse_mode=ParseMode.HTML,
-        )
+            hold_h = (_time.time() - pos.filled_at) / 3600 if pos.filled_at else 0
+
+            lines.append(
+                f"\n<b>{sym} {pos.side.upper()}</b>\n"
+                f"  Entry: <code>{pos.entry_price:.2f}</code> ({pos.kind})\n"
+                f"  Now: <code>{price:.2f}</code>\n"
+                f"  PnL: <code>{sign}{margin_pnl:.2f}%</code> (${sign}{pnl_usd:.2f})\n"
+                f"  SL: <code>{pos.stop_loss:.2f}</code>{sl_tag} | "
+                f"TP: <code>{pos.take_profit:.2f}</code>{tp_tag}\n"
+                f"  Hold: <code>{hold_h:.1f}h</code>"
+            )
+
+        total_sign = "+" if total_pnl_usd >= 0 else ""
+        lines.append(f"\n<b>Total: ${total_sign}{total_pnl_usd:.2f}</b>")
+
+        self.trader.exchange.switch_symbol(self.trader.config.hl_symbol)
+
+        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
     async def _cmd_config(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not self._is_authorized(update):
@@ -391,11 +419,21 @@ class TelegramBot:
             mode = "PAPER"
         else:
             mode = "LIVE MAINNET" if c.hl_mainnet else "LIVE TESTNET"
+        multi_info = ""
+        if c.hl_multi_symbol:
+            symbols = c.hl_symbols if c.hl_symbols else f"top {c.hl_scan_top_n} by volume"
+            multi_info = (
+                f"Multi-symbol: <code>ON</code>\n"
+                f"Symbols: <code>{symbols}</code>\n"
+                f"Max positions: <code>{c.hl_max_positions}</code>\n"
+            )
+
         await update.message.reply_text(
             f"<b>Config</b>\n\n"
             f"Mode: <code>{mode}</code>\n"
             f"Exchange: <code>{c.exchange_backend}</code>\n"
             f"Symbol: <code>{symbol}</code>\n"
+            f"{multi_info}"
             f"Timeframe: <code>{c.timeframe}</code>\n"
             f"Order size: <code>{c.order_size}</code>\n"
             f"Leverage: <code>{c.hl_leverage}x</code> (max {c.hl_max_leverage}x)\n"

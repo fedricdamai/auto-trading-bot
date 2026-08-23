@@ -143,13 +143,14 @@ class HyperliquidExchange:
             logger.error(f"Failed to get frontend open orders: {e}")
             return []
 
-    def get_position(self) -> dict | None:
-        """Return current position for the configured symbol, or None."""
+    def get_position(self, symbol: str | None = None) -> dict | None:
+        """Return current position for a symbol (default: configured symbol)."""
+        coin = symbol or self.config.hl_symbol
         try:
             state = self.info.user_state(self.address)
             for pos in state.get("assetPositions", []):
                 item = pos.get("position", {})
-                if item.get("coin") == self.config.hl_symbol:
+                if item.get("coin") == coin:
                     szi = float(item.get("szi", "0"))
                     if szi != 0:
                         return {
@@ -162,6 +163,70 @@ class HyperliquidExchange:
         except Exception as e:
             logger.error(f"Failed to get position: {e}")
         return None
+
+    def get_all_positions(self) -> list[dict]:
+        """Return all open positions across all symbols."""
+        positions = []
+        try:
+            state = self.info.user_state(self.address)
+            for pos in state.get("assetPositions", []):
+                item = pos.get("position", {})
+                szi = float(item.get("szi", "0"))
+                if szi != 0:
+                    positions.append({
+                        "coin": item["coin"],
+                        "size": abs(szi),
+                        "side": "long" if szi > 0 else "short",
+                        "entry_price": float(item.get("entryPx", "0")),
+                        "unrealized_pnl": float(item.get("unrealizedPnl", "0")),
+                    })
+        except Exception as e:
+            logger.error(f"Failed to get all positions: {e}")
+        return positions
+
+    def get_open_orders_for_symbol(self, symbol: str) -> list[dict]:
+        """Return open limit orders for a specific symbol."""
+        if self.config.paper_trade:
+            return []
+        try:
+            orders = self.info.open_orders(self.address)
+            return [o for o in orders if o.get("coin") == symbol]
+        except Exception as e:
+            logger.error(f"Failed to get open orders for {symbol}: {e}")
+            return []
+
+    def cancel_orders_for_symbol(self, symbol: str) -> int:
+        """Cancel ALL open orders (limit + trigger) for a specific symbol."""
+        if self.config.paper_trade:
+            return 0
+        try:
+            orders = self.info.frontend_open_orders(self.address)
+            sym_orders = [o for o in orders if o.get("coin") == symbol]
+        except Exception as e:
+            logger.error(f"Failed to get orders for {symbol}: {e}")
+            return 0
+
+        if not sym_orders:
+            return 0
+
+        cancel_requests = [
+            {"coin": symbol, "oid": int(o["oid"])}
+            for o in sym_orders if o.get("oid") is not None
+        ]
+        if not cancel_requests:
+            return 0
+
+        try:
+            self.exchange.bulk_cancel(cancel_requests)
+            logger.info(f"[LIVE] Bulk cancelled {len(cancel_requests)} orders on {symbol}")
+        except Exception as e:
+            logger.error(f"Bulk cancel failed for {symbol}: {e}")
+            for req in cancel_requests:
+                try:
+                    self.exchange.cancel(name=symbol, oid=req["oid"])
+                except Exception:
+                    pass
+        return len(cancel_requests)
 
     def _parse_order_result(self, result: dict, expected_sz: float, mid_price: float) -> tuple[float, float]:
         """Extract fill price and size from Hyperliquid order response."""

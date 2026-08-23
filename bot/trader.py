@@ -19,6 +19,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class PendingOrder:
     """A single limit order waiting to be filled."""
+    symbol: str
     oid: int | str | None
     price: float
     quantity: float
@@ -35,6 +36,7 @@ class PendingOrder:
 
 @dataclass
 class OpenPosition:
+    symbol: str
     entry_price: float
     quantity: float
     side: str           # "long" or "short"
@@ -53,24 +55,26 @@ class OpenPosition:
 
 
 class Trader:
-    """Limit-order trader: one order at the highest-confidence S/R level."""
+    """Multi-symbol limit-order trader: takes every good opportunity."""
 
     def __init__(self, config: Config, exchange, notifier: TelegramNotifier | None = None):
         self.config = config
         self.exchange = exchange
         self.notifier = notifier
-        self.position: OpenPosition | None = None
-        self.pending_order: PendingOrder | None = None
-        self.known_levels: dict[float, Level] = {}
+
+        self.positions: dict[str, OpenPosition] = {}
+        self.pending_orders: dict[str, PendingOrder] = {}
+        self.known_levels: dict[str, dict[float, Level]] = {}
         self.last_level_refresh: float = 0
         self.last_doji_check: float = 0
         self.last_doji_signal: DojiSignal | None = None
         self.last_exit_time: float = 0
-        self.last_trend_bias: TrendBias | None = None
+        self.last_trend_bias: dict[str, TrendBias] = {}
         self._synced: bool = False
         self.scanner: MarketScanner | None = None
         self.last_scan_time: float = 0
         self.scan_interval: int = 300
+        self.max_positions: int = config.hl_max_positions
 
         if config.hl_multi_symbol and hasattr(exchange, "info"):
             self.scanner = MarketScanner(exchange.info, config)
@@ -80,59 +84,110 @@ class Trader:
         self._apply_learned_params()
 
     @property
+    def position(self) -> OpenPosition | None:
+        if self.positions:
+            return next(iter(self.positions.values()))
+        return None
+
+    @property
+    def pending_order(self) -> PendingOrder | None:
+        if self.pending_orders:
+            return next(iter(self.pending_orders.values()))
+        return None
+
+    @property
     def open_positions(self) -> list[OpenPosition]:
-        return [self.position] if self.position else []
+        return list(self.positions.values())
+
+    def _get_symbols(self) -> list[str]:
+        if self.config.hl_multi_symbol and self.config.hl_symbols:
+            return [s.strip() for s in self.config.hl_symbols.split(",") if s.strip()]
+        return [self.config.hl_symbol]
 
     def run_once(self) -> dict:
-        """Single tick: check order/position state, refresh levels, act."""
+        """Single tick: manage all positions/orders, scan for new opportunities."""
         now = time.time()
-        current_price = self.exchange.get_ticker_price()
 
         if not self._synced:
-            self._sync_from_exchange(current_price)
+            self._sync_all_from_exchange()
             self._synced = True
 
+        symbols = self._get_symbols()
+
         if now - self.last_level_refresh >= self.config.level_refresh_seconds:
-            self._refresh_levels(current_price)
+            for sym in symbols:
+                self.exchange.switch_symbol(sym)
+                price = self.exchange.get_ticker_price()
+                self._refresh_levels_for(sym, price)
             self.last_level_refresh = now
 
         if now - self.last_doji_check >= self.config.doji_check_seconds:
             self._check_doji()
             self.last_doji_check = now
 
-        if self.position:
-            self._manage_position(current_price)
-        elif self.pending_order:
-            self._check_pending_order(current_price)
-        else:
-            if now - self.last_exit_time >= self.config.cooldown_seconds:
-                self._place_best_order(current_price)
+        for sym in list(self.positions.keys()):
+            self.exchange.switch_symbol(sym)
+            try:
+                price = self.exchange.get_ticker_price()
+                self._manage_position(sym, price)
+            except Exception as e:
+                logger.error(f"Error managing {sym} position: {e}")
+
+        for sym in list(self.pending_orders.keys()):
+            self.exchange.switch_symbol(sym)
+            try:
+                price = self.exchange.get_ticker_price()
+                self._check_pending_order(sym, price)
+            except Exception as e:
+                logger.error(f"Error checking {sym} pending order: {e}")
+
+        if now - self.last_exit_time >= self.config.cooldown_seconds:
+            active_count = len(self.positions) + len(self.pending_orders)
+            if active_count < self.max_positions:
+                self._scan_and_place(symbols)
+
+        self.exchange.switch_symbol(self.config.hl_symbol)
+
+        primary_price = 0
+        try:
+            primary_price = self.exchange.get_ticker_price()
+        except Exception:
+            pass
 
         return {
-            "current_price": current_price,
-            "levels_detected": len(self.known_levels),
-            "pending_orders": 1 if self.pending_order else 0,
-            "open_positions": 1 if self.position else 0,
-            "position_side": self.position.side if self.position else None,
+            "current_price": primary_price,
+            "levels_detected": sum(len(v) for v in self.known_levels.values()),
+            "pending_orders": len(self.pending_orders),
+            "open_positions": len(self.positions),
+            "position_side": ", ".join(f"{s}:{p.side}" for s, p in self.positions.items()) or None,
+            "symbols_active": list(set(list(self.positions.keys()) + list(self.pending_orders.keys()))) or None,
         }
 
-    def _sync_from_exchange(self, current_price: float):
-        """One-time startup sync: recover state from exchange."""
+    # ── Startup sync ────────────────────────────────────────────────
+
+    def _sync_all_from_exchange(self):
+        """Recover positions and orders across all symbols from exchange."""
         if self.config.paper_trade:
             return
 
-        position = self.exchange.get_position()
-        if position and position["size"] > 0:
-            entry = position["entry_price"]
-            side = position["side"]
+        all_pos = self.exchange.get_all_positions()
+        for pos_data in all_pos:
+            sym = pos_data["coin"]
+            if sym not in self._get_symbols():
+                continue
+            entry = pos_data["entry_price"]
+            side = pos_data["side"]
             kind = "support" if side == "long" else "resistance"
             tpsl = compute_tp_sl(
                 entry, self.config.hl_leverage,
                 self.config.target_pnl_pct, self.config.max_loss_pct, side,
             )
-            self.position = OpenPosition(
+            self.exchange.switch_symbol(sym)
+            price = self.exchange.get_ticker_price()
+            self.positions[sym] = OpenPosition(
+                symbol=sym,
                 entry_price=entry,
-                quantity=position["size"],
+                quantity=pos_data["size"],
                 side=side,
                 kind=kind,
                 level_price=entry,
@@ -140,55 +195,57 @@ class Trader:
                 take_profit=tpsl["tp_price"],
                 initial_sl=tpsl["sl_price"],
                 initial_tp=tpsl["tp_price"],
-                highest_price=current_price,
-                lowest_price=current_price,
+                highest_price=price,
+                lowest_price=price,
                 strength=0,
                 filled_at=time.time(),
             )
             logger.info(
-                f"Synced position from exchange: {side} {position['size']} @ {entry} | "
+                f"Synced {sym} position: {side} {pos_data['size']} @ {entry} | "
                 f"SL: {tpsl['sl_price']:.2f} TP: {tpsl['tp_price']:.2f}"
             )
-            return
 
-        open_orders = self.exchange.get_open_orders()
-        if not open_orders:
-            return
+        for sym in self._get_symbols():
+            if sym in self.positions:
+                continue
+            orders = self.exchange.get_open_orders_for_symbol(sym)
+            if not orders:
+                continue
+            if len(orders) > 1:
+                cancelled = self.exchange.cancel_orders_for_symbol(sym)
+                logger.info(f"Startup cleanup: cancelled {cancelled} duplicate orders on {sym}")
+                continue
 
-        if len(open_orders) > 1:
-            cancelled = self.exchange.cancel_all_orders()
-            logger.info(f"Startup cleanup: cancelled {cancelled} duplicate orders")
-            return
-
-        o = open_orders[0]
-        price = float(o.get("limitPx", 0))
-        side_raw = o.get("side", "")
-        side = "long" if side_raw == "B" else "short"
-        kind = "support" if side == "long" else "resistance"
-        qty = float(o.get("sz", 0))
-        tpsl = compute_tp_sl(
-            price, self.config.hl_leverage,
-            self.config.target_pnl_pct, self.config.max_loss_pct, side,
-        )
-        self.pending_order = PendingOrder(
-            oid=o.get("oid"),
-            price=price,
-            quantity=qty,
-            side=side,
-            kind=kind,
-            level_price=price,
-            strength=0,
-            effective_strength=0,
-            timeframes=[],
-            stop_loss=tpsl["sl_price"],
-            take_profit=tpsl["tp_price"],
-            placed_at=time.time(),
-        )
-        logger.info(f"Synced pending order from exchange: {side} @ {price} oid={o.get('oid')}")
+            o = orders[0]
+            price = float(o.get("limitPx", 0))
+            side_raw = o.get("side", "")
+            side = "long" if side_raw == "B" else "short"
+            kind = "support" if side == "long" else "resistance"
+            qty = float(o.get("sz", 0))
+            tpsl = compute_tp_sl(
+                price, self.config.hl_leverage,
+                self.config.target_pnl_pct, self.config.max_loss_pct, side,
+            )
+            self.pending_orders[sym] = PendingOrder(
+                symbol=sym,
+                oid=o.get("oid"),
+                price=price,
+                quantity=qty,
+                side=side,
+                kind=kind,
+                level_price=price,
+                strength=0,
+                effective_strength=0,
+                timeframes=[],
+                stop_loss=tpsl["sl_price"],
+                take_profit=tpsl["tp_price"],
+                placed_at=time.time(),
+            )
+            logger.info(f"Synced {sym} pending order: {side} @ {price}")
 
     # ── Level detection ──────────────────────────────────────────────
 
-    def _refresh_levels(self, current_price: float):
+    def _refresh_levels_for(self, symbol: str, current_price: float):
         try:
             levels = detect_levels_multi_tf(
                 self.exchange,
@@ -196,7 +253,7 @@ class Trader:
                 min_touches=self.config.min_touches,
             )
         except Exception as e:
-            logger.warning(f"Multi-TF detection failed, falling back to single TF: {e}")
+            logger.warning(f"Multi-TF detection failed for {symbol}, falling back: {e}")
             try:
                 df = self.exchange.fetch_ohlcv()
                 levels = detect_levels(
@@ -205,42 +262,21 @@ class Trader:
                     min_touches=self.config.min_touches,
                 )
             except Exception as e2:
-                logger.error(f"Level detection failed: {e2}")
+                logger.error(f"Level detection failed for {symbol}: {e2}")
                 return
 
-        self.known_levels = {l.price: l for l in levels}
+        self.known_levels[symbol] = {l.price: l for l in levels}
 
-        support = sorted(
-            [l for l in levels if l.kind == "support"],
-            key=lambda l: abs(current_price - l.price),
-        )
-        resistance = sorted(
-            [l for l in levels if l.kind == "resistance"],
-            key=lambda l: abs(current_price - l.price),
-        )
-
+        support = [l for l in levels if l.kind == "support"]
+        resistance = [l for l in levels if l.kind == "resistance"]
         fib_count = sum(1 for l in levels if l.fib_ratio is not None)
         logger.info(
-            f"Levels refreshed: {len(support)} support, {len(resistance)} resistance, "
-            f"{fib_count} fibonacci | Price: {current_price:.2f}"
+            f"[{symbol}] Levels: {len(support)} support, {len(resistance)} resistance, "
+            f"{fib_count} fib | Price: {current_price:.2f}"
         )
-        for l in levels[:10]:
-            tfs = ",".join(l.timeframes) if l.timeframes else "-"
-            dist = abs(current_price - l.price) / current_price * 100
-            fib_tag = f" Fib{l.fib_ratio}" if l.fib_ratio else ""
-            logger.info(f"  {l.kind.upper():>10} {l.price:.2f} | str={l.strength} t={l.touches} [{tfs}] {dist:.1f}%{fib_tag}")
 
-        if self.notifier:
-            def _lv_info(l):
-                return {"price": l.price, "fib": l.fib_ratio}
-            self.notifier.notify_levels(
-                current_price,
-                [_lv_info(l) for l in support[:5]],
-                [_lv_info(l) for l in resistance[:5]],
-            )
-
-        if self.pending_order and not self.position:
-            self._reevaluate_pending_order(current_price)
+        if symbol in self.pending_orders and symbol not in self.positions:
+            self._reevaluate_pending_order(symbol, current_price)
 
     def _check_doji(self):
         try:
@@ -248,34 +284,141 @@ class Trader:
             signal = detect_doji(df)
             if signal and signal.strength >= 40:
                 self.last_doji_signal = signal
-                logger.info(
-                    f"DOJI detected: {signal.signal} | strength={signal.strength:.0f} "
-                    f"@ {signal.price:.2f} range={signal.candle_range:.2f}"
-                )
-                if self.notifier:
-                    self.notifier.send(
-                        f"<b>Doji Signal: {signal.signal.upper()}</b>\n"
-                        f"Price: <code>{signal.price:.2f}</code>\n"
-                        f"Strength: <code>{signal.strength:.0f}</code>\n"
-                        f"Range: <code>{signal.candle_range:.2f}</code>"
-                    )
             else:
                 self.last_doji_signal = None
         except Exception as e:
             logger.warning(f"Doji check failed: {e}")
 
+    # ── Scanning and placing ────────────────────────────────────────
+
+    def _scan_and_place(self, symbols: list[str]):
+        """Scan all symbols and place orders on every good opportunity."""
+        for sym in symbols:
+            if sym in self.positions or sym in self.pending_orders:
+                continue
+            if len(self.positions) + len(self.pending_orders) >= self.max_positions:
+                break
+
+            self.exchange.switch_symbol(sym)
+            try:
+                current_price = self.exchange.get_ticker_price()
+            except Exception:
+                continue
+
+            try:
+                trend = compute_trend_bias(self.exchange)
+                self.last_trend_bias[sym] = trend
+            except Exception:
+                trend = TrendBias(direction="neutral", confidence=0)
+
+            sym_levels = self.known_levels.get(sym, {})
+            if not sym_levels:
+                continue
+
+            best_level, best_strength = self._find_best_level(sym, current_price, trend)
+            if not best_level:
+                continue
+
+            try:
+                bo_check = check_breakout_fakeout(self.exchange, best_level, current_price)
+            except Exception:
+                bo_check = BreakoutCheck(
+                    is_breakout=False, is_fakeout=False, confidence=0,
+                    volume_confirmed=False, momentum_confirmed=False,
+                    trend_aligned=False, retest_seen=False,
+                )
+
+            distance_pct = abs(current_price - best_level.price) / best_level.price * 100
+            report = self._build_report(sym, best_level, best_strength, distance_pct, trend, bo_check)
+
+            if bo_check.is_fakeout:
+                report["decision"] = f"SKIP {sym} (FAKEOUT)"
+                report["reason"] = (
+                    f"{sym} level {best_level.price:.2f} flagged as fakeout "
+                    f"({bo_check.confidence:.0f}% conf)."
+                )
+                logger.info(f"SKIP {sym} fakeout at {best_level.kind} {best_level.price:.2f}")
+                if self.notifier:
+                    self.notifier.notify_decision_report(report)
+                continue
+
+            if trend.confidence >= 55:
+                if trend.direction == "bullish" and best_level.kind == "resistance":
+                    report["decision"] = f"SKIP {sym} (TREND CONFLICT)"
+                    report["reason"] = f"{sym}: Trend bullish but level is resistance."
+                    logger.info(f"SKIP {sym}: bullish trend vs resistance")
+                    if self.notifier:
+                        self.notifier.notify_decision_report(report)
+                    continue
+                if trend.direction == "bearish" and best_level.kind == "support":
+                    report["decision"] = f"SKIP {sym} (TREND CONFLICT)"
+                    report["reason"] = f"{sym}: Trend bearish but level is support."
+                    logger.info(f"SKIP {sym}: bearish trend vs support")
+                    if self.notifier:
+                        self.notifier.notify_decision_report(report)
+                    continue
+
+            side = "long" if best_level.kind == "support" else "short"
+            report["decision"] = f"PLACE {side.upper()} on {sym}"
+            report["reason"] = (
+                f"Limit {side} at {best_level.kind} {best_level.price:.2f} | "
+                f"Trend: {trend.direction} ({trend.confidence:.0f}%) | "
+                f"Breakout: {bo_check.confidence:.0f}%"
+            )
+
+            logger.info(f"DECISION: {report['decision']} — {report['reason']}")
+            if self.notifier:
+                self.notifier.notify_decision_report(report)
+
+            existing_orders = self.exchange.get_open_orders()
+            if existing_orders:
+                self.exchange.cancel_all_orders()
+                logger.info(f"Cancelled {len(existing_orders)} stale orders on {sym}")
+
+            self._place_limit_order(sym, current_price, best_level, best_strength)
+
+    def _build_report(self, symbol, level, strength, distance_pct, trend, bo_check):
+        return {
+            "symbol": symbol,
+            "level": {
+                "price": level.price,
+                "kind": level.kind,
+                "strength": level.strength,
+                "effective_strength": round(strength, 1),
+                "timeframes": ",".join(level.timeframes) if level.timeframes else "-",
+                "fib_ratio": level.fib_ratio,
+                "distance_pct": round(distance_pct, 2),
+            },
+            "trend": {
+                "direction": trend.direction,
+                "confidence": trend.confidence,
+                "tf_details": trend.tf_details,
+            },
+            "breakout": {
+                "is_breakout": bo_check.is_breakout,
+                "is_fakeout": bo_check.is_fakeout,
+                "confidence": bo_check.confidence,
+                "volume_confirmed": bo_check.volume_confirmed,
+                "momentum_confirmed": bo_check.momentum_confirmed,
+                "trend_aligned": bo_check.trend_aligned,
+                "retest_seen": bo_check.retest_seen,
+                "details": bo_check.details,
+            },
+        }
+
     # ── Best-level selection ─────────────────────────────────────────
 
-    def _find_best_level(self, current_price: float, trend: TrendBias | None = None) -> tuple[Level | None, float]:
-        """Return the single highest-confidence level and its effective strength."""
-        if not self.known_levels:
+    def _find_best_level(self, symbol: str, current_price: float,
+                         trend: TrendBias | None = None) -> tuple[Level | None, float]:
+        sym_levels = self.known_levels.get(symbol, {})
+        if not sym_levels:
             return None, 0
 
         lp = self.learner.params
         best_level = None
         best_strength = 0.0
 
-        for level in self.known_levels.values():
+        for level in sym_levels.values():
             if level.strength < lp.min_strength:
                 continue
             tfs = level.timeframes or []
@@ -289,9 +432,7 @@ class Trader:
                     continue
 
             distance_pct = abs(current_price - level.price) / level.price * 100
-            if distance_pct > 10:
-                continue
-            if distance_pct < 0.3:
+            if distance_pct > 10 or distance_pct < 0.3:
                 continue
 
             weight = lp.support_weight if level.kind == "support" else lp.resistance_weight
@@ -320,186 +461,13 @@ class Trader:
 
     # ── Limit order placement ────────────────────────────────────────
 
-    def _place_best_order(self, current_price: float):
-        """Ensure exactly 1 limit order at the best S/R level.
-
-        In multi-symbol mode, scans all markets first and switches to
-        the best opportunity. Runs trend bias + breakout/fakeout analysis
-        and sends a decision report to Telegram before placing or skipping.
-        """
-        position = self.exchange.get_position()
-        if position and position["size"] > 0:
-            return
-
-        if self.scanner and time.time() - self.last_scan_time >= self.scan_interval:
-            self._run_multi_symbol_scan(current_price)
-
-        try:
-            trend = compute_trend_bias(self.exchange)
-            self.last_trend_bias = trend
-            logger.info(
-                f"Trend bias [{self.config.hl_symbol}]: {trend.direction.upper()} ({trend.confidence:.0f}%)"
-            )
-        except Exception as e:
-            logger.warning(f"Trend bias computation failed: {e}")
-            trend = TrendBias(direction="neutral", confidence=0)
-
-        best_level, best_strength = self._find_best_level(current_price, trend)
-        if not best_level:
-            return
-
-        open_orders = self.exchange.get_open_orders()
-
-        if len(open_orders) == 1:
-            existing_price = float(open_orders[0].get("limitPx", 0))
-            if existing_price > 0:
-                diff_pct = abs(best_level.price - existing_price) / existing_price * 100
-                if diff_pct < 0.5:
-                    return
-
-        try:
-            bo_check = check_breakout_fakeout(self.exchange, best_level, current_price)
-        except Exception as e:
-            logger.warning(f"Breakout check failed: {e}")
-            bo_check = BreakoutCheck(
-                is_breakout=False, is_fakeout=False, confidence=0,
-                volume_confirmed=False, momentum_confirmed=False,
-                trend_aligned=False, retest_seen=False, details=str(e),
-            )
-
-        distance_pct = abs(current_price - best_level.price) / best_level.price * 100
-        report = {
-            "level": {
-                "price": best_level.price,
-                "kind": best_level.kind,
-                "strength": best_level.strength,
-                "effective_strength": round(best_strength, 1),
-                "timeframes": ",".join(best_level.timeframes) if best_level.timeframes else "-",
-                "fib_ratio": best_level.fib_ratio,
-                "distance_pct": round(distance_pct, 2),
-            },
-            "trend": {
-                "direction": trend.direction,
-                "confidence": trend.confidence,
-                "tf_details": trend.tf_details,
-            },
-            "breakout": {
-                "is_breakout": bo_check.is_breakout,
-                "is_fakeout": bo_check.is_fakeout,
-                "confidence": bo_check.confidence,
-                "volume_confirmed": bo_check.volume_confirmed,
-                "momentum_confirmed": bo_check.momentum_confirmed,
-                "trend_aligned": bo_check.trend_aligned,
-                "retest_seen": bo_check.retest_seen,
-                "details": bo_check.details,
-            },
-        }
-
-        if bo_check.is_fakeout:
-            report["decision"] = "SKIP (FAKEOUT)"
-            report["reason"] = (
-                f"Level {best_level.price:.2f} breakout flagged as fakeout "
-                f"({bo_check.confidence:.0f}% conf). Not placing order."
-            )
-            logger.info(f"SKIP fakeout at {best_level.kind} {best_level.price:.2f}: {bo_check.details}")
-            if self.notifier:
-                self.notifier.notify_decision_report(report)
-            return
-
-        if trend.confidence >= 55:
-            if trend.direction == "bullish" and best_level.kind == "resistance":
-                report["decision"] = "SKIP (TREND CONFLICT)"
-                report["reason"] = "Trend is bullish but best level is resistance — skipping."
-                logger.info("SKIP: bullish trend vs resistance level")
-                if self.notifier:
-                    self.notifier.notify_decision_report(report)
-                return
-            if trend.direction == "bearish" and best_level.kind == "support":
-                report["decision"] = "SKIP (TREND CONFLICT)"
-                report["reason"] = "Trend is bearish but best level is support — skipping."
-                logger.info("SKIP: bearish trend vs support level")
-                if self.notifier:
-                    self.notifier.notify_decision_report(report)
-                return
-
-        side = "long" if best_level.kind == "support" else "short"
-        report["decision"] = f"PLACE {side.upper()}"
-        report["reason"] = (
-            f"Placing limit {side} at {best_level.kind} {best_level.price:.2f} | "
-            f"Trend: {trend.direction} ({trend.confidence:.0f}%) | "
-            f"Breakout conf: {bo_check.confidence:.0f}%"
-        )
-
-        logger.info(f"DECISION: {report['decision']} — {report['reason']}")
-        if self.notifier:
-            self.notifier.notify_decision_report(report)
-
-        if open_orders:
-            self.exchange.cancel_all_orders()
-            self.pending_order = None
-            logger.info(f"Cancelled {len(open_orders)} orders (stale/duplicate cleanup)")
-
-        self._place_limit_order(current_price, best_level, best_strength)
-
-    def _run_multi_symbol_scan(self, current_price: float):
-        """Scan multiple markets and switch to the best opportunity."""
-        self.last_scan_time = time.time()
-
-        symbols = None
-        if self.config.hl_symbols:
-            symbols = [s.strip() for s in self.config.hl_symbols.split(",") if s.strip()]
-
-        logger.info(f"Scanning {'custom list' if symbols else f'top {self.config.hl_scan_top_n}'} markets...")
-        opportunities = self.scanner.scan_all(
-            symbols=symbols,
-            top_n=self.config.hl_scan_top_n,
-        )
-
-        if not opportunities:
-            logger.info("No opportunities found across scanned markets")
-            return
-
-        best = opportunities[0]
-
-        if best.symbol != self.config.hl_symbol:
-            open_orders = self.exchange.get_open_orders()
-            if open_orders:
-                self.exchange.cancel_all_orders()
-                self.pending_order = None
-                logger.info(f"Cancelled orders on {self.config.hl_symbol} for symbol switch")
-
-            self.exchange.switch_symbol(best.symbol)
-            self.known_levels = {}
-            self.last_level_refresh = 0
-
-        scan_summary = "\n".join(
-            f"  {i+1}. {o.symbol}: score={o.score:.1f} | {o.level.kind} @ {o.level.price:.2f} | "
-            f"trend={o.trend.direction} ({o.trend.confidence:.0f}%)"
-            for i, o in enumerate(opportunities[:5])
-        )
-        logger.info(f"Top opportunities:\n{scan_summary}")
-
-        if self.notifier:
-            lines = [f"<b>MARKET SCAN ({len(opportunities)} found)</b>\n"]
-            for i, o in enumerate(opportunities[:5]):
-                marker = " [ACTIVE]" if o.symbol == self.config.hl_symbol else ""
-                lines.append(
-                    f"{i+1}. <code>{o.symbol}</code> score={o.score:.1f}{marker}\n"
-                    f"   {o.level.kind} @ <code>{o.level.price:.2f}</code> | "
-                    f"trend: {o.trend.direction} ({o.trend.confidence:.0f}%)"
-                )
-            self.notifier.send("\n".join(lines))
-
-    def _place_limit_order(self, current_price: float, level: Level, effective_strength: float):
+    def _place_limit_order(self, symbol: str, current_price: float,
+                           level: Level, effective_strength: float):
         leverage = self.config.hl_leverage
         order_size = self.config.order_size * self.learner.params.confidence_scale
-
-        if level.kind == "support":
-            side = "long"
-        else:
-            side = "short"
-
+        side = "long" if level.kind == "support" else "short"
         entry_price = level.price
+
         tpsl = compute_tp_sl(
             entry_price, leverage,
             self.config.target_pnl_pct, self.config.max_loss_pct,
@@ -514,15 +482,12 @@ class Trader:
 
             if order.get("status") == "filled":
                 self._create_position_from_fill(
-                    fill_price=order["price"],
-                    quantity=order["amount"],
-                    side=side,
-                    level=level,
-                    tpsl=tpsl,
+                    symbol, order["price"], order["amount"], side, level, tpsl,
                 )
                 return
 
-            self.pending_order = PendingOrder(
+            self.pending_orders[symbol] = PendingOrder(
+                symbol=symbol,
                 oid=order.get("oid"),
                 price=entry_price,
                 quantity=order["amount"],
@@ -539,9 +504,9 @@ class Trader:
 
             fib_tag = f" Fib{level.fib_ratio}" if level.fib_ratio else ""
             logger.info(
-                f"LIMIT {side.upper()} at {level.kind.upper()} {level.price:.2f}{fib_tag} | "
+                f"[{symbol}] LIMIT {side.upper()} at {level.kind.upper()} {level.price:.2f}{fib_tag} | "
                 f"Size: {order['amount']} | SL: {tpsl['sl_price']:.2f} | "
-                f"TP: {tpsl['tp_price']:.2f} | Strength: {effective_strength:.1f}"
+                f"TP: {tpsl['tp_price']:.2f} | Str: {effective_strength:.1f}"
             )
 
             if self.notifier:
@@ -549,49 +514,49 @@ class Trader:
                 if level.fib_ratio:
                     level_label = f"{level.kind} (Fib {level.fib_ratio})"
                 self.notifier.notify_limit_order(
-                    side, level.price, level_label, order["amount"],
+                    side, level.price, f"{symbol} {level_label}", order["amount"],
                     tpsl["sl_price"], tpsl["tp_price"], leverage, effective_strength,
                 )
 
         except Exception as e:
-            logger.error(f"Failed to place limit {side} at {entry_price} (size ${order_size}): {e}")
+            logger.error(f"[{symbol}] Failed to place limit {side} at {entry_price}: {e}")
             if self.notifier:
-                self.notifier.notify_error(f"Limit {side} failed at {entry_price}: {e}")
+                self.notifier.notify_error(f"{symbol} limit {side} failed: {e}")
 
     # ── Pending order management ─────────────────────────────────────
 
-    def _check_pending_order(self, current_price: float):
-        """Check if the pending order was filled, expired, or should be replaced."""
-        order = self.pending_order
+    def _check_pending_order(self, symbol: str, current_price: float):
+        order = self.pending_orders.get(symbol)
+        if not order:
+            return
 
         if time.time() - order.placed_at > self.config.order_ttl_hours * 3600:
-            logger.info(f"Order expired after {self.config.order_ttl_hours}h")
-            self._cancel_pending_order()
+            logger.info(f"[{symbol}] Order expired after {self.config.order_ttl_hours}h")
+            self._cancel_pending_order(symbol)
             return
 
         if self.config.paper_trade:
             if order.side == "long" and current_price <= order.price:
-                self._on_order_filled(order, order.price, order.quantity)
+                self._on_order_filled(symbol, order, order.price, order.quantity)
             elif order.side == "short" and current_price >= order.price:
-                self._on_order_filled(order, order.price, order.quantity)
+                self._on_order_filled(symbol, order, order.price, order.quantity)
             return
 
-        open_orders = self.exchange.get_open_orders()
+        open_orders = self.exchange.get_open_orders_for_symbol(symbol)
         our_order_open = any(
             str(o.get("oid")) == str(order.oid)
             for o in open_orders
         ) if order.oid is not None else False
 
         if not our_order_open:
-            position = self.exchange.get_position()
+            position = self.exchange.get_position(symbol)
             if position and position["size"] > 0:
-                self._on_order_filled(order, position["entry_price"], position["size"])
+                self._on_order_filled(symbol, order, position["entry_price"], position["size"])
             else:
-                logger.info(f"Pending order {order.oid} no longer open")
-                self.pending_order = None
+                logger.info(f"[{symbol}] Pending order {order.oid} no longer open")
+                self.pending_orders.pop(symbol, None)
 
-    def _on_order_filled(self, order: PendingOrder, fill_price: float, fill_qty: float):
-        """Handle a limit order fill by creating a position."""
+    def _on_order_filled(self, symbol: str, order: PendingOrder, fill_price: float, fill_qty: float):
         level = Level(
             price=order.level_price,
             kind=order.kind,
@@ -602,13 +567,14 @@ class Trader:
             timeframes=order.timeframes,
         )
         tpsl = {"sl_price": order.stop_loss, "tp_price": order.take_profit}
-        self._create_position_from_fill(fill_price, fill_qty, order.side, level, tpsl)
-        self.pending_order = None
+        self._create_position_from_fill(symbol, fill_price, fill_qty, order.side, level, tpsl)
+        self.pending_orders.pop(symbol, None)
 
-    def _create_position_from_fill(self, fill_price: float, quantity: float,
+    def _create_position_from_fill(self, symbol: str, fill_price: float, quantity: float,
                                    side: str, level: Level, tpsl: dict):
         leverage = self.config.hl_leverage
-        self.position = OpenPosition(
+        self.positions[symbol] = OpenPosition(
+            symbol=symbol,
             entry_price=fill_price,
             quantity=quantity,
             side=side,
@@ -627,100 +593,100 @@ class Trader:
         )
 
         logger.info(
-            f"ORDER FILLED — {side.upper()} @ {fill_price:.2f} | "
-            f"Qty: {quantity} | SL: {tpsl['sl_price']:.2f} | TP: {tpsl['tp_price']:.2f} | "
-            f"{leverage}x lev"
+            f"[{symbol}] FILLED — {side.upper()} @ {fill_price:.2f} | "
+            f"Qty: {quantity} | SL: {tpsl['sl_price']:.2f} | TP: {tpsl['tp_price']:.2f}"
         )
 
         try:
             self.exchange.place_tp_sl_orders(
                 quantity, side, tpsl["tp_price"], tpsl["sl_price"],
             )
-            logger.info("TP/SL trigger orders placed on exchange")
+            logger.info(f"[{symbol}] TP/SL triggers placed")
         except Exception as e:
-            logger.error(f"Failed to place TP/SL triggers: {e}")
+            logger.error(f"[{symbol}] TP/SL trigger placement failed: {e}")
             if self.notifier:
-                self.notifier.notify_error(f"TP/SL trigger placement failed: {e}")
+                self.notifier.notify_error(f"{symbol} TP/SL failed: {e}")
 
         if self.notifier:
             self.notifier.notify_entry(
-                side, level.price, level.kind, fill_price, quantity,
+                side, level.price, f"{symbol} {level.kind}", fill_price, quantity,
                 tpsl["sl_price"], tpsl["tp_price"], leverage,
             )
 
-    def _reevaluate_pending_order(self, current_price: float):
-        """Every 5min level refresh: re-validate thesis, replace if better level found."""
-        order = self.pending_order
+    def _reevaluate_pending_order(self, symbol: str, current_price: float):
+        order = self.pending_orders.get(symbol)
         if not order:
             return
 
-        best_level, best_strength = self._find_best_level(current_price, self.last_trend_bias)
+        trend = self.last_trend_bias.get(symbol)
+        best_level, best_strength = self._find_best_level(symbol, current_price, trend)
         if not best_level:
             return
 
         if abs(best_level.price - order.level_price) / order.level_price < 0.002:
-            logger.info(f"Thesis validated: {order.kind} @ {order.level_price:.2f} still best")
             return
 
         if best_strength > order.effective_strength * 1.15:
             logger.info(
-                f"Thesis changed — replacing: {order.kind} @ {order.level_price:.2f} "
-                f"(str {order.effective_strength:.1f}) -> "
-                f"{best_level.kind} @ {best_level.price:.2f} (str {best_strength:.1f})"
+                f"[{symbol}] Thesis changed: {order.kind} @ {order.level_price:.2f} "
+                f"-> {best_level.kind} @ {best_level.price:.2f}"
             )
-            self._cancel_pending_order()
-            self._place_limit_order(current_price, best_level, best_strength)
+            self._cancel_pending_order(symbol)
+            self._place_limit_order(symbol, current_price, best_level, best_strength)
 
-    def _cancel_pending_order(self):
-        """Cancel the current pending order (and any strays)."""
-        order = self.pending_order
+    def _cancel_pending_order(self, symbol: str):
+        order = self.pending_orders.get(symbol)
         if not order:
             return
 
         if not self.config.paper_trade:
             try:
-                self.exchange.cancel_all_orders()
+                self.exchange.cancel_orders_for_symbol(symbol)
             except Exception as e:
-                logger.warning(f"Cancel failed (may be filled): {e}")
-                position = self.exchange.get_position()
+                logger.warning(f"[{symbol}] Cancel failed: {e}")
+                position = self.exchange.get_position(symbol)
                 if position and position["size"] > 0:
-                    self._on_order_filled(order, position["entry_price"], position["size"])
+                    self._on_order_filled(symbol, order, position["entry_price"], position["size"])
                     return
 
         if self.notifier:
             self.notifier.notify_order_cancelled(
-                order.side, order.level_price, order.kind,
+                order.side, order.level_price, f"{symbol} {order.kind}",
             )
-        self.pending_order = None
+        self.pending_orders.pop(symbol, None)
 
     # ── Position management ──────────────────────────────────────────
 
-    def _manage_position(self, current_price: float):
-        pos = self.position
+    def _manage_position(self, symbol: str, current_price: float):
+        pos = self.positions.get(symbol)
+        if not pos:
+            return
+
+        sym_levels = self.known_levels.get(symbol, {})
 
         if pos.side == "long":
             if current_price > pos.highest_price:
                 pos.highest_price = current_price
-            self._trail_long(pos, current_price)
+            self._trail_long(pos, current_price, sym_levels)
             if current_price <= pos.stop_loss:
-                self._close_position(current_price, "stop_loss")
+                self._close_position(symbol, current_price, "stop_loss")
             elif current_price >= pos.take_profit:
-                self._close_position(current_price, "take_profit")
+                self._close_position(symbol, current_price, "take_profit")
         else:
             if current_price < pos.lowest_price:
                 pos.lowest_price = current_price
-            self._trail_short(pos, current_price)
+            self._trail_short(pos, current_price, sym_levels)
             if current_price >= pos.stop_loss:
-                self._close_position(current_price, "stop_loss")
+                self._close_position(symbol, current_price, "stop_loss")
             elif current_price <= pos.take_profit:
-                self._close_position(current_price, "take_profit")
+                self._close_position(symbol, current_price, "take_profit")
 
-    def _trail_long(self, pos: OpenPosition, current_price: float):
-        if not self.known_levels:
+    def _trail_long(self, pos: OpenPosition, current_price: float, levels: dict):
+        if not levels:
             return
 
         leverage = self.config.hl_leverage
-        levels_sorted = sorted(self.known_levels.values(), key=lambda l: l.price)
+        levels_sorted = sorted(levels.values(), key=lambda l: l.price)
 
         supports_below = [l for l in levels_sorted if l.kind == "support" and l.price < current_price]
         resistances_above = [l for l in levels_sorted if l.kind == "resistance" and l.price > current_price]
@@ -729,28 +695,23 @@ class Trader:
             nearest_support = supports_below[-1].price
             new_sl = round(nearest_support * 0.998, 2)
             if new_sl > pos.stop_loss:
-                old_sl = pos.stop_loss
                 pos.stop_loss = new_sl
-                logger.info(f"  Long SL trailed: {old_sl:.2f} -> {pos.stop_loss:.2f} (support @ {nearest_support:.2f})")
 
         profit_pct = (current_price - pos.entry_price) / pos.entry_price * 100 * leverage
         if profit_pct >= self.config.target_pnl_pct and pos.stop_loss < pos.entry_price:
             pos.stop_loss = round(pos.entry_price * 1.001, 2)
-            logger.info(f"  Long SL moved to breakeven: {pos.stop_loss:.2f}")
 
         if resistances_above and current_price >= pos.initial_tp * 0.995:
             next_resistance = resistances_above[0].price
             if next_resistance > pos.take_profit:
-                old_tp = pos.take_profit
                 pos.take_profit = round(next_resistance * 0.998, 2)
-                logger.info(f"  Long TP extended: {old_tp:.2f} -> {pos.take_profit:.2f}")
 
-    def _trail_short(self, pos: OpenPosition, current_price: float):
-        if not self.known_levels:
+    def _trail_short(self, pos: OpenPosition, current_price: float, levels: dict):
+        if not levels:
             return
 
         leverage = self.config.hl_leverage
-        levels_sorted = sorted(self.known_levels.values(), key=lambda l: l.price)
+        levels_sorted = sorted(levels.values(), key=lambda l: l.price)
 
         resistances_above = [l for l in levels_sorted if l.kind == "resistance" and l.price > current_price]
         supports_below = [l for l in levels_sorted if l.kind == "support" and l.price < current_price]
@@ -759,24 +720,22 @@ class Trader:
             nearest_resistance = resistances_above[0].price
             new_sl = round(nearest_resistance * 1.002, 2)
             if new_sl < pos.stop_loss:
-                old_sl = pos.stop_loss
                 pos.stop_loss = new_sl
-                logger.info(f"  Short SL trailed: {old_sl:.2f} -> {pos.stop_loss:.2f} (resistance @ {nearest_resistance:.2f})")
 
         profit_pct = (pos.entry_price - current_price) / pos.entry_price * 100 * leverage
         if profit_pct >= self.config.target_pnl_pct and pos.stop_loss > pos.entry_price:
             pos.stop_loss = round(pos.entry_price * 0.999, 2)
-            logger.info(f"  Short SL moved to breakeven: {pos.stop_loss:.2f}")
 
         if supports_below and current_price <= pos.initial_tp * 1.005:
             next_support = supports_below[-1].price
             if next_support < pos.take_profit:
-                old_tp = pos.take_profit
                 pos.take_profit = round(next_support * 1.002, 2)
-                logger.info(f"  Short TP extended: {old_tp:.2f} -> {pos.take_profit:.2f}")
 
-    def _close_position(self, exit_price: float, reason: str):
-        pos = self.position
+    def _close_position(self, symbol: str, exit_price: float, reason: str):
+        pos = self.positions.get(symbol)
+        if not pos:
+            return
+
         leverage = self.config.hl_leverage
 
         if pos.side == "long":
@@ -786,31 +745,31 @@ class Trader:
 
         margin_pnl = price_pnl * leverage
 
-        cancelled = self.exchange.cancel_all_orders()
+        cancelled = self.exchange.cancel_orders_for_symbol(symbol)
         if cancelled:
-            logger.info(f"Cancelled {cancelled} orders (incl. TP/SL triggers) before closing")
+            logger.info(f"[{symbol}] Cancelled {cancelled} orders before closing")
 
         try:
             self.exchange.place_market_close(pos.quantity, side=pos.side)
         except Exception as e:
-            logger.error(f"Failed to close {pos.side}: {e}")
+            logger.error(f"[{symbol}] Failed to close {pos.side}: {e}")
             if self.notifier:
-                self.notifier.notify_error(f"Close failed: {e}")
+                self.notifier.notify_error(f"{symbol} close failed: {e}")
             return
 
         logger.info(
-            f"{reason.upper()} — {pos.side.upper()} @ {pos.entry_price:.2f} | "
-            f"Exit: {exit_price:.2f} | PnL: {price_pnl:+.2f}% price, {margin_pnl:+.2f}% margin"
+            f"[{symbol}] {reason.upper()} — {pos.side.upper()} @ {pos.entry_price:.2f} | "
+            f"Exit: {exit_price:.2f} | PnL: {price_pnl:+.2f}% / {margin_pnl:+.2f}% margin"
         )
 
         if self.notifier:
             self.notifier.notify_exit(
-                reason, pos.level_price, pos.kind, exit_price,
+                reason, pos.level_price, f"{symbol} {pos.kind}", exit_price,
                 pos.entry_price, leverage, pos.side,
             )
 
         self._record_trade(pos, exit_price, reason)
-        self.position = None
+        self.positions.pop(symbol, None)
         self.last_exit_time = time.time()
 
         self.learner.learn()
@@ -857,29 +816,24 @@ class Trader:
         if self.journal.stats()["total"] >= 5:
             self.config.target_pnl_pct = lp.target_pnl_pct
             self.config.max_loss_pct = lp.max_loss_pct
-            logger.info(
-                f"Learned params applied: min_str={lp.min_strength} min_tf={lp.min_timeframes} "
-                f"sup={lp.support_weight:.1f}x res={lp.resistance_weight:.1f}x "
-                f"size={lp.confidence_scale:.2f}x tp={lp.target_pnl_pct}% sl={lp.max_loss_pct}%"
-            )
 
     # ── Main loop ────────────────────────────────────────────────────
 
     def run_loop(self):
         mode = "PAPER" if self.config.paper_trade else "LIVE"
         backend = self.config.exchange_backend.upper()
-        symbol = self.config.hl_symbol if self.config.exchange_backend == "hyperliquid" else self.config.symbol
+        symbols = self._get_symbols()
 
-        logger.info(f"Starting limit-order bot [{mode}] on {backend} — {symbol}")
+        logger.info(f"Starting multi-symbol bot [{mode}] on {backend}")
+        logger.info(f"Symbols: {', '.join(symbols)} | Max positions: {self.max_positions}")
         logger.info(
-            f"Tick interval: {self.config.check_interval}s | "
-            f"Level refresh: {self.config.level_refresh_seconds}s | "
-            f"Max 1 limit order at highest-confidence level"
+            f"Tick: {self.config.check_interval}s | "
+            f"Level refresh: {self.config.level_refresh_seconds}s"
         )
 
         if self.notifier:
             self.notifier.notify_startup(
-                symbol, self.config.timeframe, self.config.paper_trade,
+                ", ".join(symbols), self.config.timeframe, self.config.paper_trade,
                 self.config.hl_leverage, self.config.hl_mainnet,
             )
 
@@ -887,14 +841,14 @@ class Trader:
             try:
                 summary = self.run_once()
                 pos_info = ""
-                if summary["position_side"]:
-                    pos_info = f" | {summary['position_side'].upper()} open"
+                if summary["open_positions"]:
+                    pos_info = f" | Positions: {summary['position_side']}"
                 elif summary["pending_orders"]:
-                    po = self.pending_order
-                    pos_info = f" | LIMIT {po.side.upper()} @ {po.price:.2f}"
+                    pends = [f"{s}:{o.side}@{o.price:.0f}" for s, o in self.pending_orders.items()]
+                    pos_info = f" | Pending: {', '.join(pends)}"
                 logger.info(
-                    f"Tick: {summary['current_price']:.2f} | "
-                    f"Levels: {summary['levels_detected']}{pos_info}"
+                    f"Tick: levels={summary['levels_detected']} "
+                    f"pos={summary['open_positions']} pend={summary['pending_orders']}{pos_info}"
                 )
             except Exception as e:
                 logger.error(f"Tick error: {e}")

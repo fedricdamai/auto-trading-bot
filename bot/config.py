@@ -28,6 +28,7 @@ class Config:
     hl_multi_symbol: bool = os.getenv("HL_MULTI_SYMBOL", "true").lower() == "true"
     hl_symbols: str = os.getenv("HL_SYMBOLS", "BTC,ETH,SOL,HYPE,BNB")
     hl_scan_top_n: int = int(os.getenv("HL_SCAN_TOP_N", "10"))
+    hl_max_positions: int = int(os.getenv("HL_MAX_POSITIONS", "5"))
 
     # Shared trading settings
     timeframe: str = os.getenv("TIMEFRAME", "5m")
