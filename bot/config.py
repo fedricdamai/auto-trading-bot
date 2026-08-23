@@ -20,7 +20,8 @@ class Config:
     hl_wallet_address: str = os.getenv("HL_WALLET_ADDRESS", "")
     hl_private_key: str = os.getenv("HL_PRIVATE_KEY", "")
     hl_symbol: str = os.getenv("HL_SYMBOL", "BTC")
-    hl_leverage: int = int(os.getenv("HL_LEVERAGE", "1"))
+    hl_leverage: int = int(os.getenv("HL_LEVERAGE", "3"))
+    hl_max_leverage: int = int(os.getenv("HL_MAX_LEVERAGE", "5"))
     hl_mainnet: bool = os.getenv("HL_MAINNET", "false").lower() == "true"
 
     # Shared trading settings
@@ -29,8 +30,8 @@ class Config:
     min_touches: int = int(os.getenv("MIN_TOUCHES", "2"))
     level_tolerance_pct: float = float(os.getenv("LEVEL_TOLERANCE_PCT", "0.5"))
     order_size: float = float(os.getenv("ORDER_SIZE", "50"))
-    stop_loss_pct: float = float(os.getenv("STOP_LOSS_PCT", "2.0"))
-    take_profit_pct: float = float(os.getenv("TAKE_PROFIT_PCT", "4.0"))
+    target_pnl_pct: float = float(os.getenv("TARGET_PNL_PCT", "1.0"))
+    max_loss_pct: float = float(os.getenv("MAX_LOSS_PCT", "1.0"))
     check_interval: int = int(os.getenv("CHECK_INTERVAL", "300"))
     paper_trade: bool = os.getenv("PAPER_TRADE", "true").lower() == "true"
     log_level: str = os.getenv("LOG_LEVEL", "INFO")

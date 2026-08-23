@@ -270,13 +270,59 @@ def _volume_score(vol_at_level: float, all_volumes: np.ndarray) -> float:
     return min(ratio / 2, 1.0)
 
 
-def get_limit_order_prices(levels: list[Level], current_price: float, max_orders: int = 5) -> list[dict]:
+def compute_tp_sl(
+    entry: float, leverage: int, target_pnl_pct: float, max_loss_pct: float,
+) -> dict:
+    """Calculate TP/SL prices for a leveraged long position.
+
+    Args:
+        entry: entry price
+        leverage: position leverage (1-5)
+        target_pnl_pct: desired profit % on margin (e.g. 1.0 = 1%)
+        max_loss_pct: max loss % on margin (e.g. 1.0 = 1%)
+
+    Returns dict with tp_price, sl_price, tp_move_pct, sl_move_pct, liq_price.
+    """
+    # Price move needed: margin_pnl% = price_move% × leverage
+    tp_move = target_pnl_pct / leverage  # price % move for target
+    sl_move = max_loss_pct / leverage    # price % move for stop
+
+    # Liquidation price (simplified): entry × (1 - 1/leverage)
+    # Add 2% buffer for fees/funding
+    liq_price = entry * (1 - (1 / leverage) + 0.02)
+
+    # SL must stay above liquidation with safety margin
+    max_sl_move = (1 / leverage) * 0.5 * 100  # 50% of liquidation distance
+    sl_move = min(sl_move, max_sl_move)
+
+    tp_price = round(entry * (1 + tp_move / 100), 2)
+    sl_price = round(entry * (1 - sl_move / 100), 2)
+
+    # Hard floor: SL must be above liquidation
+    if sl_price <= liq_price:
+        sl_price = round(liq_price * 1.02, 2)
+
+    return {
+        "tp_price": tp_price,
+        "sl_price": sl_price,
+        "tp_move_pct": round(tp_move, 4),
+        "sl_move_pct": round(sl_move, 4),
+        "liq_price": round(liq_price, 2),
+    }
+
+
+def get_limit_order_prices(
+    levels: list[Level],
+    current_price: float,
+    leverage: int = 1,
+    target_pnl_pct: float = 1.0,
+    max_loss_pct: float = 1.0,
+    max_orders: int = 5,
+) -> list[dict]:
     """Pick the best levels to place limit orders at.
 
-    For support: place limit buy slightly above the level (catch the bounce).
-    For resistance: place limit buy slightly above (catch the breakout).
-
-    Returns list of {price, kind, strength, stop_loss_pct, take_profit_pct}.
+    TP/SL are calculated based on leverage so each trade targets
+    the specified margin PnL % while staying safe from liquidation.
     """
     orders = []
     used_prices = set()
@@ -289,35 +335,28 @@ def get_limit_order_prices(levels: list[Level], current_price: float, max_orders
         if too_close:
             continue
 
-        multi_tf = level.timeframes and len(level.timeframes) >= 2
-
         if level.kind == "support":
             entry = level.price
-            if multi_tf:
-                sl_pct = 1.2 if level.strength > 60 else 2.0
-            else:
-                sl_pct = 1.5 if level.strength > 60 else 2.5
-            tp_pct = sl_pct * 2
         else:
             entry = round(level.price * 1.002, 2)
-            if multi_tf:
-                sl_pct = 1.5 if level.strength > 60 else 2.5
-            else:
-                sl_pct = 2.0 if level.strength > 60 else 3.0
-            tp_pct = sl_pct * 2
 
         distance_pct = abs(current_price - entry) / current_price * 100
         if distance_pct > 10:
             continue
+
+        tpsl = compute_tp_sl(entry, leverage, target_pnl_pct, max_loss_pct)
 
         orders.append({
             "price": entry,
             "kind": level.kind,
             "strength": level.strength,
             "touches": level.touches,
-            "sl_pct": sl_pct,
-            "tp_pct": tp_pct,
             "timeframes": level.timeframes,
+            "tp_price": tpsl["tp_price"],
+            "sl_price": tpsl["sl_price"],
+            "tp_move_pct": tpsl["tp_move_pct"],
+            "sl_move_pct": tpsl["sl_move_pct"],
+            "liq_price": tpsl["liq_price"],
         })
         used_prices.add(level.price)
 

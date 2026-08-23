@@ -92,8 +92,33 @@ class TestGetLimitOrderPrices:
             Level(price=60000, kind="support", touches=5, strength=80, volume_avg=1000, last_touch_idx=190),
             Level(price=65000, kind="resistance", touches=3, strength=60, volume_avg=800, last_touch_idx=195),
         ]
-        orders = get_limit_order_prices(levels, current_price=62000, max_orders=5)
+        orders = get_limit_order_prices(levels, current_price=62000, leverage=3, target_pnl_pct=1.0, max_loss_pct=1.0, max_orders=5)
         assert len(orders) > 0
-        assert all("sl_pct" in o and "tp_pct" in o for o in orders)
+        assert all("sl_price" in o and "tp_price" in o for o in orders)
         for o in orders:
-            assert o["tp_pct"] >= o["sl_pct"] * 2
+            assert o["tp_price"] > o["price"]
+            assert o["sl_price"] < o["price"]
+            assert o["sl_price"] > o["liq_price"]
+
+
+class TestComputeTpSl:
+    def test_1pct_target_3x_leverage(self):
+        from bot.levels import compute_tp_sl
+        result = compute_tp_sl(entry=100000, leverage=3, target_pnl_pct=1.0, max_loss_pct=1.0)
+        assert result["tp_price"] > 100000
+        assert result["sl_price"] < 100000
+        assert result["sl_price"] > result["liq_price"]
+        expected_tp_move = 1.0 / 3  # ~0.333%
+        assert abs(result["tp_move_pct"] - expected_tp_move) < 0.01
+
+    def test_sl_above_liquidation(self):
+        from bot.levels import compute_tp_sl
+        result = compute_tp_sl(entry=100000, leverage=5, target_pnl_pct=1.0, max_loss_pct=50.0)
+        assert result["sl_price"] > result["liq_price"]
+
+    def test_higher_leverage_tighter_moves(self):
+        from bot.levels import compute_tp_sl
+        r1 = compute_tp_sl(entry=100000, leverage=1, target_pnl_pct=1.0, max_loss_pct=1.0)
+        r5 = compute_tp_sl(entry=100000, leverage=5, target_pnl_pct=1.0, max_loss_pct=1.0)
+        assert r5["tp_move_pct"] < r1["tp_move_pct"]
+        assert r5["sl_move_pct"] < r1["sl_move_pct"]

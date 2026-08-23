@@ -3,7 +3,7 @@ import time
 from dataclasses import dataclass, field
 
 from bot.config import Config
-from bot.levels import detect_levels, detect_levels_multi_tf, get_limit_order_prices, Level
+from bot.levels import detect_levels, detect_levels_multi_tf, get_limit_order_prices, compute_tp_sl, Level
 from bot.telegram_notifier import TelegramNotifier
 
 logger = logging.getLogger(__name__)
@@ -113,19 +113,25 @@ class Trader:
         if available_slots <= 0:
             return
 
-        targets = get_limit_order_prices(levels, current_price, max_orders=available_slots)
+        leverage = self.config.hl_leverage
+        targets = get_limit_order_prices(
+            levels, current_price,
+            leverage=leverage,
+            target_pnl_pct=self.config.target_pnl_pct,
+            max_loss_pct=self.config.max_loss_pct,
+            max_orders=available_slots,
+        )
 
         for target in targets:
             if target["price"] in existing_prices:
                 continue
 
-            # Skip if we'd buy above current price for support
             if target["kind"] == "support" and target["price"] >= current_price:
                 continue
 
             entry = target["price"]
-            sl = round(entry * (1 - target["sl_pct"] / 100), 2)
-            tp = round(entry * (1 + target["tp_pct"] / 100), 2)
+            sl = target["sl_price"]
+            tp = target["tp_price"]
 
             try:
                 order = self.exchange.place_limit_buy(entry, self.config.order_size)
@@ -145,7 +151,8 @@ class Trader:
 
                 logger.info(
                     f"LIMIT BUY placed at {target['kind']} {entry:.2f} | "
-                    f"Strength: {target['strength']} | SL: {sl:.2f} | TP: {tp:.2f}"
+                    f"Strength: {target['strength']} | SL: {sl:.2f} | TP: {tp:.2f} | "
+                    f"{leverage}x lev | liq: {target['liq_price']:.2f}"
                 )
 
                 if self.notifier:
@@ -264,7 +271,7 @@ class Trader:
         logger.info(f"Max pending orders: {self.max_pending} | Order TTL: {self.config.order_ttl_hours}h")
 
         if self.notifier:
-            self.notifier.notify_startup(symbol, self.config.timeframe, self.config.paper_trade)
+            self.notifier.notify_startup(symbol, self.config.timeframe, self.config.paper_trade, self.config.hl_leverage)
 
         while True:
             try:

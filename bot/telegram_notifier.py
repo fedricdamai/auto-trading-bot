@@ -5,6 +5,8 @@ from telegram import Bot, Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 from telegram.constants import ParseMode
 
+from bot.levels import compute_tp_sl
+
 logger = logging.getLogger(__name__)
 
 
@@ -54,15 +56,17 @@ class TelegramBot:
 
     # ── Notification helpers ──
 
-    def notify_startup(self, symbol: str, timeframe: str, paper: bool):
+    def notify_startup(self, symbol: str, timeframe: str, paper: bool, leverage: int = 1):
         mode = "PAPER" if paper else "LIVE"
         self.send(
             f"<b>Bot Started [{mode}]</b>\n"
             f"Symbol: <code>{symbol}</code>\n"
-            f"Timeframe: <code>{timeframe}</code>\n\n"
+            f"Timeframe: <code>{timeframe}</code>\n"
+            f"Leverage: <code>{leverage}x</code>\n\n"
             f"Commands:\n"
-            f"/status - Bot status & open positions\n"
-            f"/levels - Current S/R levels\n"
+            f"/status - Bot status & positions\n"
+            f"/levels - S/R levels (multi-TF)\n"
+            f"/risk - TP/SL & leverage info\n"
             f"/orders - Pending limit orders\n"
             f"/pnl - Position P&L\n"
             f"/help - All commands"
@@ -106,12 +110,17 @@ class TelegramBot:
             return
         await update.message.reply_text(
             "<b>Auto Trading Bot</b>\n\n"
-            "Commands:\n"
+            "<b>Monitor:</b>\n"
             "/status - Bot status & positions\n"
             "/levels - Current support & resistance\n"
             "/orders - Pending limit orders\n"
             "/pnl - Position P&L\n"
-            "/config - Current settings\n"
+            "/config - Current settings\n\n"
+            "<b>Risk management:</b>\n"
+            "/risk - Show TP/SL & leverage info\n"
+            "/settp 1.5 - Set target profit % on margin\n"
+            "/setsl 0.5 - Set max loss % on margin\n"
+            "/setlev 3 - Set leverage (1-5)\n\n"
             "/help - This message",
             parse_mode=ParseMode.HTML,
         )
@@ -248,10 +257,150 @@ class TelegramBot:
             f"Order size: <code>{c.order_size}</code>\n"
             f"Max orders: <code>{c.max_open_orders}</code>\n"
             f"Order TTL: <code>{c.order_ttl_hours}h</code>\n"
-            f"Leverage: <code>{c.hl_leverage}x</code>\n"
+            f"Leverage: <code>{c.hl_leverage}x</code> (max {c.hl_max_leverage}x)\n"
+            f"Target PnL: <code>{c.target_pnl_pct}%</code>/trade\n"
+            f"Max Loss: <code>{c.max_loss_pct}%</code>/trade\n"
             f"Check interval: <code>{c.check_interval}s</code>",
             parse_mode=ParseMode.HTML,
         )
+
+    # ── Risk management commands ──
+
+    async def _cmd_risk(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not self._is_authorized(update):
+            return
+        if not self.trader:
+            await update.message.reply_text("Bot not initialized yet.")
+            return
+
+        c = self.trader.config
+        lev = c.hl_leverage
+
+        try:
+            price = self.trader.exchange.get_ticker_price()
+        except Exception:
+            price = 0
+
+        lines = [
+            f"<b>Risk Settings</b>\n",
+            f"Leverage: <code>{lev}x</code> (max {c.hl_max_leverage}x)",
+            f"Target PnL: <code>{c.target_pnl_pct}%</code> per trade (on margin)",
+            f"Max Loss: <code>{c.max_loss_pct}%</code> per trade (on margin)",
+        ]
+
+        if price > 0:
+            tpsl = compute_tp_sl(price, lev, c.target_pnl_pct, c.max_loss_pct)
+            lines.append(f"\n<b>Example @ <code>{price:.2f}</code>:</b>")
+            lines.append(f"  TP: <code>{tpsl['tp_price']:.2f}</code> (+{tpsl['tp_move_pct']:.3f}% price)")
+            lines.append(f"  SL: <code>{tpsl['sl_price']:.2f}</code> (-{tpsl['sl_move_pct']:.3f}% price)")
+            lines.append(f"  Liquidation: <code>~{tpsl['liq_price']:.2f}</code>")
+            safety = abs(tpsl['sl_price'] - tpsl['liq_price']) / price * 100
+            lines.append(f"  SL→Liq buffer: <code>{safety:.1f}%</code>")
+
+        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+    async def _cmd_settp(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not self._is_authorized(update):
+            return
+        if not self.trader:
+            await update.message.reply_text("Bot not initialized yet.")
+            return
+
+        if not context.args:
+            await update.message.reply_text("Usage: /settp 1.5\nSets target profit % on margin per trade.")
+            return
+
+        try:
+            val = float(context.args[0])
+            if val <= 0 or val > 50:
+                await update.message.reply_text("Target must be between 0.1 and 50.")
+                return
+            self.trader.config.target_pnl_pct = val
+            lev = self.trader.config.hl_leverage
+            price_move = val / lev
+            await update.message.reply_text(
+                f"Target PnL set to <code>{val}%</code> on margin.\n"
+                f"At {lev}x leverage, need <code>{price_move:.3f}%</code> price move.",
+                parse_mode=ParseMode.HTML,
+            )
+        except ValueError:
+            await update.message.reply_text("Invalid number. Usage: /settp 1.5")
+
+    async def _cmd_setsl(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not self._is_authorized(update):
+            return
+        if not self.trader:
+            await update.message.reply_text("Bot not initialized yet.")
+            return
+
+        if not context.args:
+            await update.message.reply_text("Usage: /setsl 1.0\nSets max loss % on margin per trade.")
+            return
+
+        try:
+            val = float(context.args[0])
+            if val <= 0 or val > 50:
+                await update.message.reply_text("Max loss must be between 0.1 and 50.")
+                return
+            lev = self.trader.config.hl_leverage
+            max_safe = (1 / lev) * 50  # 50% of liquidation distance
+            price_move = val / lev
+            if price_move > max_safe:
+                await update.message.reply_text(
+                    f"Too risky! At {lev}x, {val}% margin loss = {price_move:.2f}% price drop.\n"
+                    f"Max safe: <code>{max_safe * lev:.1f}%</code> margin loss.",
+                    parse_mode=ParseMode.HTML,
+                )
+                return
+            self.trader.config.max_loss_pct = val
+            await update.message.reply_text(
+                f"Max loss set to <code>{val}%</code> on margin.\n"
+                f"At {lev}x leverage, SL at <code>{price_move:.3f}%</code> price drop.",
+                parse_mode=ParseMode.HTML,
+            )
+        except ValueError:
+            await update.message.reply_text("Invalid number. Usage: /setsl 1.0")
+
+    async def _cmd_setlev(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not self._is_authorized(update):
+            return
+        if not self.trader:
+            await update.message.reply_text("Bot not initialized yet.")
+            return
+
+        if not context.args:
+            await update.message.reply_text("Usage: /setlev 3\nSets leverage (1-5).")
+            return
+
+        try:
+            val = int(context.args[0])
+            max_lev = self.trader.config.hl_max_leverage
+            if val < 1 or val > max_lev:
+                await update.message.reply_text(f"Leverage must be between 1 and {max_lev}.")
+                return
+
+            self.trader.config.hl_leverage = val
+
+            if not self.trader.config.paper_trade and hasattr(self.trader.exchange, '_set_leverage'):
+                try:
+                    self.trader.exchange.config.hl_leverage = val
+                    self.trader.exchange._set_leverage()
+                except Exception as e:
+                    logger.error(f"Failed to update exchange leverage: {e}")
+
+            tp_move = self.trader.config.target_pnl_pct / val
+            sl_move = self.trader.config.max_loss_pct / val
+            liq_dist = (1 / val) * 100
+
+            await update.message.reply_text(
+                f"Leverage set to <code>{val}x</code>\n\n"
+                f"TP price move: <code>{tp_move:.3f}%</code>\n"
+                f"SL price move: <code>{sl_move:.3f}%</code>\n"
+                f"Liquidation at: <code>~{liq_dist:.1f}%</code> drop",
+                parse_mode=ParseMode.HTML,
+            )
+        except ValueError:
+            await update.message.reply_text("Invalid number. Usage: /setlev 3")
 
     # ── Run the command listener ──
 
@@ -276,6 +425,10 @@ class TelegramBot:
         app.add_handler(CommandHandler("orders", self._cmd_orders))
         app.add_handler(CommandHandler("pnl", self._cmd_pnl))
         app.add_handler(CommandHandler("config", self._cmd_config))
+        app.add_handler(CommandHandler("risk", self._cmd_risk))
+        app.add_handler(CommandHandler("settp", self._cmd_settp))
+        app.add_handler(CommandHandler("setsl", self._cmd_setsl))
+        app.add_handler(CommandHandler("setlev", self._cmd_setlev))
 
         await app.initialize()
         await app.start()
