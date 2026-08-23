@@ -1,15 +1,15 @@
 [Unit]
-Description=Auto Trading Bot - Support & Resistance Levels
+Description=Auto Trading Bot - Limit Orders at S/R Levels
 After=network.target
 
 [Service]
 Type=simple
-User=ubuntu
-WorkingDirectory=/home/ubuntu/ClaudeVibeCode
-ExecStart=/usr/bin/python3 /home/ubuntu/ClaudeVibeCode/main.py
+User=fedricintandamai
+WorkingDirectory=/home/fedricintandamai/auto-trading-bot
+ExecStart=/home/fedricintandamai/auto-trading-bot/venv/bin/python3 /home/fedricintandamai/auto-trading-bot/main.py
 Restart=always
 RestartSec=10
-EnvironmentFile=/home/ubuntu/ClaudeVibeCode/.env
+EnvironmentFile=/home/fedricintandamai/auto-trading-bot/.env
 
 [Install]
 WantedBy=multi-user.target
