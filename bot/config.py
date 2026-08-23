@@ -20,9 +20,12 @@ class Config:
     hl_wallet_address: str = os.getenv("HL_WALLET_ADDRESS", "")
     hl_private_key: str = os.getenv("HL_PRIVATE_KEY", "")
     hl_symbol: str = os.getenv("HL_SYMBOL", "BTC")
-    hl_leverage: int = int(os.getenv("HL_LEVERAGE", "10"))
-    hl_max_leverage: int = int(os.getenv("HL_MAX_LEVERAGE", "10"))
     hl_mainnet: bool = os.getenv("HL_MAINNET", "false").lower() == "true"
+
+    # Dynamic leverage range (actual leverage per trade is computed from signal quality)
+    hl_leverage_min: int = int(os.getenv("HL_LEVERAGE_MIN", "3"))
+    hl_leverage_max: int = int(os.getenv("HL_LEVERAGE_MAX", "10"))
+    hl_leverage: int = 10  # current active leverage, set dynamically per trade
 
     # Multi-symbol scanning
     hl_multi_symbol: bool = os.getenv("HL_MULTI_SYMBOL", "true").lower() == "true"
@@ -30,8 +33,8 @@ class Config:
     hl_scan_top_n: int = int(os.getenv("HL_SCAN_TOP_N", "10"))
     hl_max_positions: int = int(os.getenv("HL_MAX_POSITIONS", "5"))
 
-    # Shared trading settings
-    timeframe: str = os.getenv("TIMEFRAME", "5m")
+    # Trading settings (timeframe is fixed at 5m for scalping; multi-TF analysis uses 1m/5m/15m/1h/4h/1d internally)
+    timeframe: str = "5m"
     lookback_candles: int = int(os.getenv("LOOKBACK_CANDLES", "200"))
     min_touches: int = int(os.getenv("MIN_TOUCHES", "2"))
     level_tolerance_pct: float = float(os.getenv("LEVEL_TOLERANCE_PCT", "0.5"))

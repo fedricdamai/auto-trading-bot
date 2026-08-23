@@ -32,6 +32,7 @@ class PendingOrder:
     stop_loss: float
     take_profit: float
     placed_at: float
+    leverage: int = 10
 
 
 @dataclass
@@ -52,6 +53,7 @@ class OpenPosition:
     timeframes: list[str] | None = None
     filled_at: float = 0.0
     doji_entry: bool = False
+    leverage: int = 10
 
 
 class Trader:
@@ -201,6 +203,7 @@ class Trader:
                 lowest_price=price,
                 strength=0,
                 filled_at=time.time(),
+                leverage=self.config.hl_leverage,
             )
             logger.info(
                 f"Synced {sym} position: {side} {pos_data['size']} @ {entry} | "
@@ -242,6 +245,7 @@ class Trader:
                 stop_loss=tpsl["sl_price"],
                 take_profit=tpsl["tp_price"],
                 placed_at=time.time(),
+                leverage=self.config.hl_leverage,
             )
             logger.info(f"Synced {sym} pending order: {side} @ {price}")
 
@@ -290,6 +294,51 @@ class Trader:
                 self.last_doji_signal = None
         except Exception as e:
             logger.warning(f"Doji check failed: {e}")
+
+    # ── Dynamic leverage ─────────────────────────────────────────────
+
+    def _compute_leverage(self, level: Level, trend: TrendBias,
+                          bo_check: BreakoutCheck, effective_strength: float) -> int:
+        """Compute leverage from signal quality: stronger signals = higher leverage."""
+        min_lev = self.config.hl_leverage_min
+        max_lev = self.config.hl_leverage_max
+        score = 0.0
+
+        # Level strength (0-30 points)
+        score += min(level.strength / 3, 30)
+
+        # Multi-timeframe confirmation (0-20 points)
+        n_tfs = len(level.timeframes) if level.timeframes else 0
+        score += min(n_tfs * 5, 20)
+
+        # Trend alignment (0-25 points)
+        if trend.confidence >= 60:
+            aligned = (
+                (trend.direction == "bullish" and level.kind == "support") or
+                (trend.direction == "bearish" and level.kind == "resistance")
+            )
+            score += 25 if aligned else 0
+        elif trend.confidence >= 40:
+            score += 10
+
+        # Breakout confirmation (0-15 points)
+        checks = sum([
+            bo_check.volume_confirmed,
+            bo_check.momentum_confirmed,
+            bo_check.trend_aligned,
+            bo_check.retest_seen,
+        ])
+        score += checks * 3.75
+
+        # Effective strength bonus (0-10 points)
+        score += min(effective_strength / 10, 10)
+
+        # Map score (0-100) to leverage range
+        ratio = min(max(score / 80, 0), 1.0)
+        leverage = int(min_lev + ratio * (max_lev - min_lev))
+        leverage = max(min_lev, min(leverage, max_lev))
+
+        return leverage
 
     # ── Scanning and placing ────────────────────────────────────────
 
@@ -361,11 +410,15 @@ class Trader:
                     continue
 
             side = "long" if best_level.kind == "support" else "short"
+            leverage = self._compute_leverage(best_level, trend, bo_check, best_strength)
+            self.config.hl_leverage = leverage
+
+            report["leverage"] = leverage
             report["decision"] = f"PLACE {side.upper()} on {sym}"
             report["reason"] = (
                 f"Limit {side} at {best_level.kind} {best_level.price:.2f} | "
                 f"Trend: {trend.direction} ({trend.confidence:.0f}%) | "
-                f"Breakout: {bo_check.confidence:.0f}%"
+                f"Breakout: {bo_check.confidence:.0f}% | Lev: {leverage}x"
             )
 
             logger.info(f"DECISION: {report['decision']} — {report['reason']}")
@@ -377,7 +430,7 @@ class Trader:
                 self.exchange.cancel_all_orders()
                 logger.info(f"Cancelled {len(existing_orders)} stale orders on {sym}")
 
-            self._place_limit_order(sym, current_price, best_level, best_strength)
+            self._place_limit_order(sym, current_price, best_level, best_strength, leverage)
 
     def _build_report(self, symbol, level, strength, distance_pct, trend, bo_check):
         return {
@@ -464,8 +517,12 @@ class Trader:
     # ── Limit order placement ────────────────────────────────────────
 
     def _place_limit_order(self, symbol: str, current_price: float,
-                           level: Level, effective_strength: float):
-        leverage = self.config.hl_leverage
+                           level: Level, effective_strength: float,
+                           leverage: int | None = None):
+        leverage = leverage or self.config.hl_leverage
+        self.config.hl_leverage = leverage
+        if hasattr(self.exchange, '_set_leverage'):
+            self.exchange._set_leverage()
         order_size = self.config.order_size * self.learner.params.confidence_scale
         side = "long" if level.kind == "support" else "short"
         entry_price = level.price
@@ -502,6 +559,7 @@ class Trader:
                 stop_loss=tpsl["sl_price"],
                 take_profit=tpsl["tp_price"],
                 placed_at=time.time(),
+                leverage=leverage,
             )
 
             fib_tag = f" Fib{level.fib_ratio}" if level.fib_ratio else ""
@@ -574,7 +632,6 @@ class Trader:
 
     def _create_position_from_fill(self, symbol: str, fill_price: float, quantity: float,
                                    side: str, level: Level, tpsl: dict):
-        leverage = self.config.hl_leverage
         self.positions[symbol] = OpenPosition(
             symbol=symbol,
             entry_price=fill_price,
@@ -592,6 +649,7 @@ class Trader:
             timeframes=level.timeframes or [],
             filled_at=time.time(),
             doji_entry=self.last_doji_signal is not None,
+            leverage=self.config.hl_leverage,
         )
 
         logger.info(

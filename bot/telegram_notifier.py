@@ -261,8 +261,10 @@ class TelegramBot:
         )
         if breakout.get("details"):
             msg += f"  <code>{breakout['details']}</code>\n"
+        lev = r.get("leverage")
+        lev_line = f"\nLeverage: <code>{lev}x</code> (dynamic)" if lev else ""
         msg += (
-            f"\n<b>4. DECISION: {decision}</b>\n"
+            f"\n<b>4. DECISION: {decision}</b>{lev_line}\n"
             f"{reason}"
         )
 
@@ -295,7 +297,8 @@ class TelegramBot:
             "/set size 1000 - Order size\n"
             "/set tp 2.5 - Target PnL %\n"
             "/set sl 1.5 - Max loss %\n"
-            "/set lev 10 - Leverage\n"
+            "/set levmin 3 - Min leverage\n"
+            "/set levmax 10 - Max leverage\n"
             "/set maxpos 5 - Max positions\n"
             "/config - Full config view\n"
             "/risk - TP/SL & leverage details\n\n"
@@ -329,6 +332,8 @@ class TelegramBot:
         total_levels = sum(len(v) for v in self.trader.known_levels.values())
         positions = self.trader.positions
         pending_orders = self.trader.pending_orders
+        lev_min = self.trader.config.hl_leverage_min
+        lev_max = self.trader.config.hl_leverage_max
         lev = self.trader.config.hl_leverage
 
         symbols_line = ", ".join(self.trader._get_symbols())
@@ -343,11 +348,12 @@ class TelegramBot:
                     sym_price = self.trader.exchange.get_ticker_price()
                 except Exception:
                     sym_price = 0
+                pos_lev = pos.leverage
                 if pos.side == "long":
                     price_pnl = (sym_price - pos.entry_price) / pos.entry_price * 100
                 else:
                     price_pnl = (pos.entry_price - sym_price) / pos.entry_price * 100
-                margin_pnl = price_pnl * lev
+                margin_pnl = price_pnl * pos_lev
                 sign = "+" if margin_pnl >= 0 else ""
                 pos_text += (
                     f"\n<b>{sym} {pos.side.upper()}</b>\n"
@@ -382,7 +388,7 @@ class TelegramBot:
         await update.message.reply_text(
             f"<b>Bot Status [{mode}]</b>\n\n"
             f"Symbols: <code>{symbols_line}</code>\n"
-            f"Leverage: <code>{lev}x</code>\n"
+            f"Leverage: <code>dynamic {lev_min}x-{lev_max}x</code> (last: {lev}x)\n"
             f"Levels tracked: <code>{total_levels}</code>\n"
             f"Positions: <code>{len(positions)}/{max_pos}</code> | "
             f"Pending: <code>{len(pending_orders)}</code>"
@@ -399,8 +405,6 @@ class TelegramBot:
 
         positions = self.trader.positions
         pending = self.trader.pending_orders
-        lev = self.trader.config.hl_leverage
-
         if not positions and not pending:
             await update.message.reply_text("No open orders or positions.")
             return
@@ -431,10 +435,11 @@ class TelegramBot:
             pend = pending.get(sym)
 
             if pos:
+                pos_lev = pos.leverage
                 if pos.side == "long":
-                    pnl_pct = (price - pos.entry_price) / pos.entry_price * 100 * lev
+                    pnl_pct = (price - pos.entry_price) / pos.entry_price * 100 * pos_lev
                 else:
-                    pnl_pct = (pos.entry_price - price) / pos.entry_price * 100 * lev
+                    pnl_pct = (pos.entry_price - price) / pos.entry_price * 100 * pos_lev
                 sign = "+" if pnl_pct >= 0 else ""
                 chart.append((pos.take_profit, f"  TP   {pos.take_profit:.2f}  ............"))
                 chart.append((pos.entry_price, f"  {pos.side[0].upper()}    {pos.entry_price:.2f}  [{sign}{pnl_pct:.1f}%]"))
@@ -545,8 +550,7 @@ class TelegramBot:
             return
 
         import time as _time
-        lev = self.trader.config.hl_leverage
-        lines = [f"<b>Open Positions PnL ({lev}x)</b>\n"]
+        lines = [f"<b>Open Positions PnL</b>\n"]
         total_pnl_usd = 0.0
 
         for sym, pos in self.trader.positions.items():
@@ -557,14 +561,15 @@ class TelegramBot:
                 lines.append(f"\n<b>{sym}</b> — price unavailable")
                 continue
 
+            pos_lev = pos.leverage
             if pos.side == "long":
                 price_pnl = (price - pos.entry_price) / pos.entry_price * 100
-                pnl_usd = pos.quantity * (price - pos.entry_price) * lev
+                pnl_usd = pos.quantity * (price - pos.entry_price) * pos_lev
             else:
                 price_pnl = (pos.entry_price - price) / pos.entry_price * 100
-                pnl_usd = pos.quantity * (pos.entry_price - price) * lev
+                pnl_usd = pos.quantity * (pos.entry_price - price) * pos_lev
 
-            margin_pnl = price_pnl * lev
+            margin_pnl = price_pnl * pos_lev
             total_pnl_usd += pnl_usd
             sign = "+" if margin_pnl >= 0 else ""
 
@@ -621,7 +626,7 @@ class TelegramBot:
             f"{multi_info}"
             f"Timeframe: <code>{c.timeframe}</code>\n"
             f"Order size: <code>{c.order_size}</code>\n"
-            f"Leverage: <code>{c.hl_leverage}x</code> (max {c.hl_max_leverage}x)\n"
+            f"Leverage: <code>dynamic {c.hl_leverage_min}x-{c.hl_leverage_max}x</code>\n"
             f"Target PnL: <code>{c.target_pnl_pct}%</code>/trade\n"
             f"Max Loss: <code>{c.max_loss_pct}%</code>/trade\n"
             f"Tick interval: <code>{c.check_interval}s</code>\n"
@@ -730,6 +735,8 @@ class TelegramBot:
 
         c = self.trader.config
         lev = c.hl_leverage
+        lev_min = c.hl_leverage_min
+        lev_max = c.hl_leverage_max
 
         try:
             price = self.trader.exchange.get_ticker_price()
@@ -738,7 +745,7 @@ class TelegramBot:
 
         lines = [
             f"<b>Risk Settings</b>\n",
-            f"Leverage: <code>{lev}x</code> (max {c.hl_max_leverage}x)",
+            f"Leverage: <code>dynamic {lev_min}x-{lev_max}x</code> (last: {lev}x)",
             f"Target PnL: <code>{c.target_pnl_pct}%</code> per trade (on margin)",
             f"Max Loss: <code>{c.max_loss_pct}%</code> per trade (on margin)",
         ]
@@ -772,11 +779,11 @@ class TelegramBot:
                 await update.message.reply_text("Target must be between 0.1 and 50.")
                 return
             self.trader.config.target_pnl_pct = val
-            lev = self.trader.config.hl_leverage
-            price_move = val / lev
+            lev_min = self.trader.config.hl_leverage_min
+            lev_max = self.trader.config.hl_leverage_max
             await update.message.reply_text(
                 f"Target PnL set to <code>{val}%</code> on margin.\n"
-                f"At {lev}x leverage, need <code>{price_move:.3f}%</code> price move.",
+                f"Price move needed: <code>{val / lev_max:.3f}%</code> ({lev_max}x) to <code>{val / lev_min:.3f}%</code> ({lev_min}x)",
                 parse_mode=ParseMode.HTML,
             )
         except ValueError:
@@ -798,20 +805,21 @@ class TelegramBot:
             if val <= 0 or val > 50:
                 await update.message.reply_text("Max loss must be between 0.1 and 50.")
                 return
-            lev = self.trader.config.hl_leverage
-            max_safe = (1 / lev) * 50
-            price_move = val / lev
-            if price_move > max_safe:
+            lev_max = self.trader.config.hl_leverage_max
+            max_safe = (1 / lev_max) * 50
+            price_move_max = val / lev_max
+            if price_move_max > max_safe:
                 await update.message.reply_text(
-                    f"Too risky! At {lev}x, {val}% margin loss = {price_move:.2f}% price drop.\n"
-                    f"Max safe: <code>{max_safe * lev:.1f}%</code> margin loss.",
+                    f"Too risky at {lev_max}x! {val}% margin loss = {price_move_max:.2f}% price drop.\n"
+                    f"Max safe: <code>{max_safe * lev_max:.1f}%</code> margin loss.",
                     parse_mode=ParseMode.HTML,
                 )
                 return
+            lev_min = self.trader.config.hl_leverage_min
             self.trader.config.max_loss_pct = val
             await update.message.reply_text(
                 f"Max loss set to <code>{val}%</code> on margin.\n"
-                f"At {lev}x leverage, SL at <code>{price_move:.3f}%</code> price drop.",
+                f"SL price drop: <code>{val / lev_max:.3f}%</code> ({lev_max}x) to <code>{val / lev_min:.3f}%</code> ({lev_min}x)",
                 parse_mode=ParseMode.HTML,
             )
         except ValueError:
@@ -824,39 +832,35 @@ class TelegramBot:
             await update.message.reply_text("Bot not initialized yet.")
             return
 
-        if not context.args:
-            await update.message.reply_text("Usage: /setlev 3\nSets leverage (1-5).")
+        if not context.args or len(context.args) < 2:
+            c = self.trader.config
+            await update.message.reply_text(
+                f"<b>Leverage Range</b>\n\n"
+                f"Current: <code>{c.hl_leverage_min}x - {c.hl_leverage_max}x</code>\n"
+                f"Last used: <code>{c.hl_leverage}x</code>\n\n"
+                f"Usage: /setlev min max\n"
+                f"Example: /setlev 3 10",
+                parse_mode=ParseMode.HTML,
+            )
             return
 
         try:
-            val = int(context.args[0])
-            max_lev = self.trader.config.hl_max_leverage
-            if val < 1 or val > max_lev:
-                await update.message.reply_text(f"Leverage must be between 1 and {max_lev}.")
+            new_min = int(context.args[0])
+            new_max = int(context.args[1])
+            if new_min < 1 or new_max > 50 or new_min > new_max:
+                await update.message.reply_text("Min must be 1+, max 50-, and min <= max.")
                 return
 
-            self.trader.config.hl_leverage = val
-
-            if not self.trader.config.paper_trade and hasattr(self.trader.exchange, '_set_leverage'):
-                try:
-                    self.trader.exchange.config.hl_leverage = val
-                    self.trader.exchange._set_leverage()
-                except Exception as e:
-                    logger.error(f"Failed to update exchange leverage: {e}")
-
-            tp_move = self.trader.config.target_pnl_pct / val
-            sl_move = self.trader.config.max_loss_pct / val
-            liq_dist = (1 / val) * 100
+            self.trader.config.hl_leverage_min = new_min
+            self.trader.config.hl_leverage_max = new_max
 
             await update.message.reply_text(
-                f"Leverage set to <code>{val}x</code>\n\n"
-                f"TP price move: <code>{tp_move:.3f}%</code>\n"
-                f"SL price move: <code>{sl_move:.3f}%</code>\n"
-                f"Liquidation at: <code>~{liq_dist:.1f}%</code> drop",
+                f"Leverage range set to <code>{new_min}x - {new_max}x</code>\n"
+                f"Actual leverage per trade is computed from signal quality.",
                 parse_mode=ParseMode.HTML,
             )
-        except ValueError:
-            await update.message.reply_text("Invalid number. Usage: /setlev 3")
+        except (ValueError, IndexError):
+            await update.message.reply_text("Usage: /setlev 3 10")
 
     async def _cmd_pause(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not self._is_authorized(update):
@@ -956,11 +960,13 @@ class TelegramBot:
                 f"<code>size    </code> {c.order_size}\n"
                 f"<code>tp      </code> {c.target_pnl_pct}%\n"
                 f"<code>sl      </code> {c.max_loss_pct}%\n"
-                f"<code>lev     </code> {c.hl_leverage}x\n"
+                f"<code>levmin  </code> {c.hl_leverage_min}x\n"
+                f"<code>levmax  </code> {c.hl_leverage_max}x\n"
                 f"<code>maxpos  </code> {c.hl_max_positions}\n"
                 f"<code>interval</code> {c.check_interval}s\n"
                 f"<code>ttl     </code> {c.order_ttl_hours}h\n"
                 f"<code>cooldown</code> {c.cooldown_seconds}s\n\n"
+                f"Leverage is dynamic ({c.hl_leverage_min}x-{c.hl_leverage_max}x) per signal quality.\n\n"
                 f"Usage: /set size 1000\n"
                 f"       /set tp 2.5\n"
                 f"       /set sl 1.5",
@@ -980,7 +986,8 @@ class TelegramBot:
             "size": ("order_size", 10, 50000, "Order size"),
             "tp": ("target_pnl_pct", 0.1, 50, "Target PnL %"),
             "sl": ("max_loss_pct", 0.1, 50, "Max loss %"),
-            "lev": ("hl_leverage", 1, c.hl_max_leverage, "Leverage"),
+            "levmin": ("hl_leverage_min", 1, 50, "Leverage min"),
+            "levmax": ("hl_leverage_max", 1, 50, "Leverage max"),
             "maxpos": ("hl_max_positions", 1, 20, "Max positions"),
             "interval": ("check_interval", 1, 300, "Check interval (s)"),
             "ttl": ("order_ttl_hours", 0.1, 72, "Order TTL (h)"),
@@ -996,17 +1003,10 @@ class TelegramBot:
             await update.message.reply_text(f"{label} must be between {min_v} and {max_v}.")
             return
 
-        if key in ("lev", "maxpos", "interval", "cooldown"):
+        if key in ("levmin", "levmax", "maxpos", "interval", "cooldown"):
             val = int(val)
 
         setattr(c, attr, val)
-
-        if key == "lev" and hasattr(self.trader.exchange, '_set_leverage'):
-            self.trader.exchange.config.hl_leverage = int(val)
-            try:
-                self.trader.exchange._set_leverage()
-            except Exception as e:
-                logger.error(f"Leverage update on exchange failed: {e}")
 
         if key == "maxpos":
             self.trader.max_positions = int(val)

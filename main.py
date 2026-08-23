@@ -49,7 +49,7 @@ def main():
     logger.info(f"  Symbol:      {symbol}")
     logger.info(f"  Timeframe:   {config.timeframe}")
     if config.exchange_backend == "hyperliquid":
-        logger.info(f"  Leverage:    {config.hl_leverage}x")
+        logger.info(f"  Leverage:    dynamic {config.hl_leverage_min}x-{config.hl_leverage_max}x")
         if config.hl_multi_symbol:
             if config.hl_symbols:
                 logger.info(f"  Multi-sym:   ON ({config.hl_symbols})")
