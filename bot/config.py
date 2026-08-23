@@ -36,12 +36,9 @@ class Config:
     paper_trade: bool = os.getenv("PAPER_TRADE", "true").lower() == "true"
     log_level: str = os.getenv("LOG_LEVEL", "INFO")
 
-    # Scalp trading settings
-    max_open_orders: int = int(os.getenv("MAX_OPEN_ORDERS", "1"))
+    # Limit order settings
     order_ttl_hours: float = float(os.getenv("ORDER_TTL_HOURS", "24"))
     level_refresh_seconds: int = int(os.getenv("LEVEL_REFRESH_SECONDS", "300"))
-    touch_pct: float = float(os.getenv("TOUCH_PCT", "0.1"))
-    approach_pct: float = float(os.getenv("APPROACH_PCT", "0.3"))
     doji_check_seconds: int = int(os.getenv("DOJI_CHECK_SECONDS", "300"))
     cooldown_seconds: int = int(os.getenv("COOLDOWN_SECONDS", "60"))
 

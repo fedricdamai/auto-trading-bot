@@ -112,6 +112,27 @@ class TelegramBot:
             msg += f"\nMargin PnL: <code>{sign}{margin_pnl:.2f}%</code> ({leverage}x)"
         self.send(msg)
 
+    def notify_limit_order(self, side: str, level: float, level_type: str,
+                           quantity: float, sl: float, tp: float,
+                           leverage: int, strength: float):
+        label = "LIMIT BUY" if side == "long" else "LIMIT SELL"
+        self.send(
+            f"<b>{label} at {level_type.upper()}</b>\n"
+            f"Level: <code>{level:.2f}</code>\n"
+            f"Entry: <code>{level:.2f}</code>\n"
+            f"Size: <code>{quantity:.6f}</code>\n"
+            f"SL: <code>{sl:.2f}</code> | TP: <code>{tp:.2f}</code>\n"
+            f"Leverage: <code>{leverage}x</code>\n"
+            f"Confidence: <code>{strength:.1f}</code>"
+        )
+
+    def notify_order_cancelled(self, side: str, level: float, level_type: str):
+        label = "BUY" if side == "long" else "SELL"
+        self.send(
+            f"<b>ORDER CANCELLED</b>\n"
+            f"Limit {label} at {level_type} <code>{level:.2f}</code>"
+        )
+
     def notify_buy(self, level: float, level_type: str, price: float, quantity: float, sl: float, tp: float):
         self.notify_entry("long", level, level_type, price, quantity, sl, tp, 1)
 
@@ -165,6 +186,7 @@ class TelegramBot:
             mode = "LIVE MAINNET" if self.trader.config.hl_mainnet else "LIVE TESTNET"
 
         pos = self.trader.position
+        pending = self.trader.pending_order
         if pos:
             lev = self.trader.config.hl_leverage
             if pos.side == "long":
@@ -181,6 +203,17 @@ class TelegramBot:
                 f"Margin PnL: <code>{sign}{margin_pnl:.2f}%</code>\n"
                 f"SL: <code>{pos.stop_loss:.2f}</code> | TP: <code>{pos.take_profit:.2f}</code>"
             )
+        elif pending:
+            label = "LIMIT BUY" if pending.side == "long" else "LIMIT SELL"
+            dist = abs(price - pending.price) / price * 100
+            pos_text = (
+                f"\n\n<b>Pending: {label}</b>\n"
+                f"Level: <code>{pending.level_price:.2f}</code> ({pending.kind})\n"
+                f"Price: <code>{pending.price:.2f}</code> ({dist:.2f}% away)\n"
+                f"Size: <code>{pending.quantity:.6f}</code>\n"
+                f"SL: <code>{pending.stop_loss:.2f}</code> | TP: <code>{pending.take_profit:.2f}</code>\n"
+                f"Confidence: <code>{pending.effective_strength:.1f}</code>"
+            )
         else:
             pos_text = "\n\nNo open position — scanning for entry..."
 
@@ -188,7 +221,8 @@ class TelegramBot:
             f"<b>Bot Status [{mode}]</b>\n\n"
             f"Price: <code>{price:.2f}</code>\n"
             f"Levels tracked: <code>{levels}</code>\n"
-            f"Tick interval: <code>{self.trader.config.check_interval}s</code>"
+            f"Pending orders: <code>{1 if pending else 0}</code>\n"
+            f"Open positions: <code>{1 if pos else 0}</code>"
             f"{pos_text}",
             parse_mode=ParseMode.HTML,
         )
@@ -295,8 +329,7 @@ class TelegramBot:
             f"Max Loss: <code>{c.max_loss_pct}%</code>/trade\n"
             f"Tick interval: <code>{c.check_interval}s</code>\n"
             f"Level refresh: <code>{c.level_refresh_seconds}s</code>\n"
-            f"Touch zone: <code>{c.touch_pct}%</code>\n"
-            f"Approach zone: <code>{c.approach_pct}%</code>\n"
+            f"Order TTL: <code>{c.order_ttl_hours}h</code>\n"
             f"Cooldown: <code>{c.cooldown_seconds}s</code>",
             parse_mode=ParseMode.HTML,
         )

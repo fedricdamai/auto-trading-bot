@@ -3,7 +3,7 @@ import pandas as pd
 import pytest
 
 from bot.levels import (
-    detect_levels, get_limit_order_prices, _find_swing_points,
+    detect_levels, _find_swing_points,
     _cluster_levels, _analyze_level, compute_tp_sl, detect_doji,
 )
 
@@ -86,43 +86,6 @@ class TestDetectLevels:
         assert len(levels) > 0
         assert all(hasattr(l, "strength") for l in levels)
         assert levels[0].strength >= levels[-1].strength
-
-
-class TestGetLimitOrderPrices:
-    def test_returns_order_targets(self):
-        from bot.levels import Level
-        levels = [
-            Level(price=60000, kind="support", touches=5, strength=80, volume_avg=1000, last_touch_idx=190),
-            Level(price=65000, kind="resistance", touches=3, strength=60, volume_avg=800, last_touch_idx=195),
-        ]
-        orders = get_limit_order_prices(levels, current_price=62000, leverage=3, target_pnl_pct=1.0, max_loss_pct=1.0, max_orders=5)
-        assert len(orders) > 0
-        for o in orders:
-            assert "sl_price" in o
-            assert "tp_price" in o
-            assert "side" in o
-
-    def test_support_orders_are_long(self):
-        from bot.levels import Level
-        levels = [
-            Level(price=60000, kind="support", touches=5, strength=80, volume_avg=1000, last_touch_idx=190),
-        ]
-        orders = get_limit_order_prices(levels, current_price=62000, leverage=3)
-        assert len(orders) == 1
-        assert orders[0]["side"] == "long"
-        assert orders[0]["tp_price"] > orders[0]["price"]
-        assert orders[0]["sl_price"] < orders[0]["price"]
-
-    def test_resistance_orders_are_short(self):
-        from bot.levels import Level
-        levels = [
-            Level(price=65000, kind="resistance", touches=3, strength=60, volume_avg=800, last_touch_idx=195),
-        ]
-        orders = get_limit_order_prices(levels, current_price=62000, leverage=3)
-        assert len(orders) == 1
-        assert orders[0]["side"] == "short"
-        assert orders[0]["tp_price"] < orders[0]["price"]
-        assert orders[0]["sl_price"] > orders[0]["price"]
 
 
 class TestComputeTpSl:

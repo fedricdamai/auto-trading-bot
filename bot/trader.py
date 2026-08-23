@@ -1,6 +1,6 @@
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from bot.config import Config
 from bot.levels import (
@@ -12,6 +12,23 @@ from bot.trade_journal import TradeJournal, TradeRecord
 from bot.strategy_learner import StrategyLearner
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class PendingOrder:
+    """A single limit order waiting to be filled."""
+    oid: int | str | None
+    price: float
+    quantity: float
+    side: str           # "long" or "short"
+    kind: str           # "support" or "resistance"
+    level_price: float
+    strength: float
+    effective_strength: float
+    timeframes: list[str]
+    stop_loss: float
+    take_profit: float
+    placed_at: float
 
 
 @dataclass
@@ -34,19 +51,19 @@ class OpenPosition:
 
 
 class Trader:
-    """Scalp trader: fast price polling, enter on S/R touch, long+short."""
+    """Limit-order trader: one order at the highest-confidence S/R level."""
 
     def __init__(self, config: Config, exchange, notifier: TelegramNotifier | None = None):
         self.config = config
         self.exchange = exchange
         self.notifier = notifier
         self.position: OpenPosition | None = None
+        self.pending_order: PendingOrder | None = None
         self.known_levels: dict[float, Level] = {}
         self.last_level_refresh: float = 0
         self.last_doji_check: float = 0
         self.last_doji_signal: DojiSignal | None = None
         self.last_exit_time: float = 0
-        self.pending_orders: list = []
 
         self.journal = TradeJournal()
         self.learner = StrategyLearner(self.journal)
@@ -57,7 +74,7 @@ class Trader:
         return [self.position] if self.position else []
 
     def run_once(self) -> dict:
-        """Single tick: refresh levels if needed, manage position or look for entry."""
+        """Single tick: check order/position state, refresh levels, act."""
         now = time.time()
         current_price = self.exchange.get_ticker_price()
 
@@ -71,17 +88,21 @@ class Trader:
 
         if self.position:
             self._manage_position(current_price)
+        elif self.pending_order:
+            self._check_pending_order(current_price)
         else:
             if now - self.last_exit_time >= self.config.cooldown_seconds:
-                self._scan_for_entry(current_price)
+                self._place_best_order(current_price)
 
         return {
             "current_price": current_price,
             "levels_detected": len(self.known_levels),
-            "pending_orders": 0,
+            "pending_orders": 1 if self.pending_order else 0,
             "open_positions": 1 if self.position else 0,
             "position_side": self.position.side if self.position else None,
         }
+
+    # ── Level detection ──────────────────────────────────────────────
 
     def _refresh_levels(self, current_price: float):
         try:
@@ -123,6 +144,9 @@ class Trader:
                 [l.price for l in resistance[:5]],
             )
 
+        if self.pending_order and not self.position:
+            self._reevaluate_pending_order(current_price)
+
     def _check_doji(self):
         try:
             df = self.exchange.fetch_ohlcv(timeframe="5m", lookback=20)
@@ -145,15 +169,16 @@ class Trader:
         except Exception as e:
             logger.warning(f"Doji check failed: {e}")
 
-    def _scan_for_entry(self, current_price: float):
+    # ── Best-level selection ─────────────────────────────────────────
+
+    def _find_best_level(self, current_price: float) -> tuple[Level | None, float]:
+        """Return the single highest-confidence level and its effective strength."""
         if not self.known_levels:
-            return
+            return None, 0
 
         lp = self.learner.params
-        leverage = self.config.hl_leverage
-
-        best_entry = None
-        best_strength = 0
+        best_level = None
+        best_strength = 0.0
 
         for level in self.known_levels.values():
             if level.strength < lp.min_strength:
@@ -163,13 +188,7 @@ class Trader:
                 continue
 
             distance_pct = abs(current_price - level.price) / level.price * 100
-
-            if distance_pct > self.config.touch_pct:
-                if distance_pct <= self.config.approach_pct:
-                    logger.debug(
-                        f"Approaching {level.kind} @ {level.price:.2f} "
-                        f"(dist={distance_pct:.3f}%)"
-                    )
+            if distance_pct > 10:
                 continue
 
             weight = lp.support_weight if level.kind == "support" else lp.resistance_weight
@@ -191,127 +210,225 @@ class Trader:
 
             if effective_strength > best_strength:
                 best_strength = effective_strength
-                best_entry = level
+                best_level = level
 
-        if best_entry:
-            if best_entry.kind == "support":
-                self._enter_long(current_price, best_entry)
+        return best_level, best_strength
+
+    # ── Limit order placement ────────────────────────────────────────
+
+    def _place_best_order(self, current_price: float):
+        """Find the best level and place a single limit order there."""
+        best_level, best_strength = self._find_best_level(current_price)
+        if not best_level:
+            return
+        self._place_limit_order(current_price, best_level, best_strength)
+
+    def _place_limit_order(self, current_price: float, level: Level, effective_strength: float):
+        leverage = self.config.hl_leverage
+        order_size = self.config.order_size * self.learner.params.confidence_scale
+
+        if level.kind == "support":
+            side = "long"
+        else:
+            side = "short"
+
+        entry_price = level.price
+        tpsl = compute_tp_sl(
+            entry_price, leverage,
+            self.config.target_pnl_pct, self.config.max_loss_pct,
+            side=side,
+        )
+
+        try:
+            if side == "long":
+                order = self.exchange.place_limit_buy(entry_price, order_size)
             else:
-                self._enter_short(current_price, best_entry)
+                order = self.exchange.place_limit_sell(entry_price, order_size)
 
-    def _enter_long(self, price: float, level: Level):
-        leverage = self.config.hl_leverage
-        order_size = self.config.order_size * self.learner.params.confidence_scale
-        tpsl = compute_tp_sl(price, leverage, self.config.target_pnl_pct, self.config.max_loss_pct, side="long")
+            if order.get("status") == "filled":
+                self._create_position_from_fill(
+                    fill_price=order["price"],
+                    quantity=order["amount"],
+                    side=side,
+                    level=level,
+                    tpsl=tpsl,
+                )
+                return
 
-        try:
-            order = self.exchange.place_market_buy(order_size)
-            qty = order["amount"]
-            fill_price = order["price"]
-
-            self.position = OpenPosition(
-                entry_price=fill_price,
-                quantity=qty,
-                side="long",
+            self.pending_order = PendingOrder(
+                oid=order.get("oid"),
+                price=entry_price,
+                quantity=order["amount"],
+                side=side,
                 kind=level.kind,
                 level_price=level.price,
+                strength=level.strength,
+                effective_strength=effective_strength,
+                timeframes=level.timeframes or [],
                 stop_loss=tpsl["sl_price"],
                 take_profit=tpsl["tp_price"],
-                initial_sl=tpsl["sl_price"],
-                initial_tp=tpsl["tp_price"],
-                highest_price=fill_price,
-                lowest_price=fill_price,
-                strength=level.strength,
-                timeframes=level.timeframes or [],
-                filled_at=time.time(),
-                doji_entry=self.last_doji_signal is not None,
+                placed_at=time.time(),
             )
 
             logger.info(
-                f"LONG ENTRY at support {level.price:.2f} | "
-                f"Fill: {fill_price:.2f} | Qty: {qty} | "
-                f"SL: {tpsl['sl_price']:.2f} | TP: {tpsl['tp_price']:.2f} | "
-                f"{leverage}x lev"
+                f"LIMIT {side.upper()} at {level.kind.upper()} {level.price:.2f} | "
+                f"Size: {order['amount']} | SL: {tpsl['sl_price']:.2f} | "
+                f"TP: {tpsl['tp_price']:.2f} | Strength: {effective_strength:.1f}"
             )
 
             if self.notifier:
-                self.notifier.notify_entry(
-                    "long", level.price, level.kind, fill_price, qty,
-                    tpsl["sl_price"], tpsl["tp_price"], leverage,
+                self.notifier.notify_limit_order(
+                    side, level.price, level.kind, order["amount"],
+                    tpsl["sl_price"], tpsl["tp_price"], leverage, effective_strength,
                 )
 
         except Exception as e:
-            logger.error(f"Failed to enter long: {e}")
+            logger.error(f"Failed to place limit {side}: {e}")
             if self.notifier:
-                self.notifier.notify_error(f"Long entry failed: {e}")
+                self.notifier.notify_error(f"Limit {side} failed: {e}")
 
-    def _enter_short(self, price: float, level: Level):
+    # ── Pending order management ─────────────────────────────────────
+
+    def _check_pending_order(self, current_price: float):
+        """Check if the pending order was filled, expired, or should be replaced."""
+        order = self.pending_order
+
+        if time.time() - order.placed_at > self.config.order_ttl_hours * 3600:
+            logger.info(f"Order expired after {self.config.order_ttl_hours}h")
+            self._cancel_pending_order()
+            return
+
+        if self.config.paper_trade:
+            if order.side == "long" and current_price <= order.price:
+                self._on_order_filled(order, order.price, order.quantity)
+            elif order.side == "short" and current_price >= order.price:
+                self._on_order_filled(order, order.price, order.quantity)
+            return
+
+        open_orders = self.exchange.get_open_orders()
+        our_order_open = any(
+            str(o.get("oid")) == str(order.oid)
+            for o in open_orders
+        ) if order.oid is not None else False
+
+        if not our_order_open:
+            position = self.exchange.get_position()
+            if position and position["size"] > 0:
+                self._on_order_filled(order, position["entry_price"], position["size"])
+            else:
+                logger.info(f"Pending order {order.oid} no longer open")
+                self.pending_order = None
+
+    def _on_order_filled(self, order: PendingOrder, fill_price: float, fill_qty: float):
+        """Handle a limit order fill by creating a position."""
+        level = Level(
+            price=order.level_price,
+            kind=order.kind,
+            touches=0,
+            strength=order.strength,
+            volume_avg=0,
+            last_touch_idx=0,
+            timeframes=order.timeframes,
+        )
+        tpsl = {"sl_price": order.stop_loss, "tp_price": order.take_profit}
+        self._create_position_from_fill(fill_price, fill_qty, order.side, level, tpsl)
+        self.pending_order = None
+
+    def _create_position_from_fill(self, fill_price: float, quantity: float,
+                                   side: str, level: Level, tpsl: dict):
         leverage = self.config.hl_leverage
-        order_size = self.config.order_size * self.learner.params.confidence_scale
-        tpsl = compute_tp_sl(price, leverage, self.config.target_pnl_pct, self.config.max_loss_pct, side="short")
+        self.position = OpenPosition(
+            entry_price=fill_price,
+            quantity=quantity,
+            side=side,
+            kind=level.kind,
+            level_price=level.price,
+            stop_loss=tpsl["sl_price"],
+            take_profit=tpsl["tp_price"],
+            initial_sl=tpsl["sl_price"],
+            initial_tp=tpsl["tp_price"],
+            highest_price=fill_price,
+            lowest_price=fill_price,
+            strength=level.strength,
+            timeframes=level.timeframes or [],
+            filled_at=time.time(),
+            doji_entry=self.last_doji_signal is not None,
+        )
 
-        try:
-            order = self.exchange.place_market_short(order_size)
-            qty = order["amount"]
-            fill_price = order["price"]
+        logger.info(
+            f"ORDER FILLED — {side.upper()} @ {fill_price:.2f} | "
+            f"Qty: {quantity} | SL: {tpsl['sl_price']:.2f} | TP: {tpsl['tp_price']:.2f} | "
+            f"{leverage}x lev"
+        )
 
-            self.position = OpenPosition(
-                entry_price=fill_price,
-                quantity=qty,
-                side="short",
-                kind=level.kind,
-                level_price=level.price,
-                stop_loss=tpsl["sl_price"],
-                take_profit=tpsl["tp_price"],
-                initial_sl=tpsl["sl_price"],
-                initial_tp=tpsl["tp_price"],
-                highest_price=fill_price,
-                lowest_price=fill_price,
-                strength=level.strength,
-                timeframes=level.timeframes or [],
-                filled_at=time.time(),
-                doji_entry=self.last_doji_signal is not None,
+        if self.notifier:
+            self.notifier.notify_entry(
+                side, level.price, level.kind, fill_price, quantity,
+                tpsl["sl_price"], tpsl["tp_price"], leverage,
             )
 
+    def _reevaluate_pending_order(self, current_price: float):
+        """Cancel and replace if a significantly stronger level appeared."""
+        order = self.pending_order
+        if not order:
+            return
+
+        best_level, best_strength = self._find_best_level(current_price)
+        if not best_level:
+            return
+
+        if abs(best_level.price - order.level_price) / order.level_price < 0.002:
+            return
+
+        if best_strength > order.effective_strength * 1.15:
             logger.info(
-                f"SHORT ENTRY at resistance {level.price:.2f} | "
-                f"Fill: {fill_price:.2f} | Qty: {qty} | "
-                f"SL: {tpsl['sl_price']:.2f} | TP: {tpsl['tp_price']:.2f} | "
-                f"{leverage}x lev"
+                f"Replacing order: {order.kind} @ {order.level_price:.2f} "
+                f"(str {order.effective_strength:.1f}) -> "
+                f"{best_level.kind} @ {best_level.price:.2f} (str {best_strength:.1f})"
             )
+            self._cancel_pending_order()
+            self._place_limit_order(current_price, best_level, best_strength)
 
-            if self.notifier:
-                self.notifier.notify_entry(
-                    "short", level.price, level.kind, fill_price, qty,
-                    tpsl["sl_price"], tpsl["tp_price"], leverage,
-                )
+    def _cancel_pending_order(self):
+        """Cancel the current pending order."""
+        order = self.pending_order
+        if not order:
+            return
 
-        except Exception as e:
-            logger.error(f"Failed to enter short: {e}")
-            if self.notifier:
-                self.notifier.notify_error(f"Short entry failed: {e}")
+        if not self.config.paper_trade and order.oid is not None:
+            try:
+                self.exchange.cancel_order(order.price, order.oid)
+                logger.info(f"Cancelled order oid={order.oid}")
+            except Exception as e:
+                logger.warning(f"Cancel failed (may be filled): {e}")
+                position = self.exchange.get_position()
+                if position and position["size"] > 0:
+                    self._on_order_filled(order, position["entry_price"], position["size"])
+                    return
+
+        if self.notifier:
+            self.notifier.notify_order_cancelled(
+                order.side, order.level_price, order.kind,
+            )
+        self.pending_order = None
+
+    # ── Position management ──────────────────────────────────────────
 
     def _manage_position(self, current_price: float):
         pos = self.position
-        leverage = self.config.hl_leverage
 
         if pos.side == "long":
             if current_price > pos.highest_price:
                 pos.highest_price = current_price
-
             self._trail_long(pos, current_price)
-
             if current_price <= pos.stop_loss:
                 self._close_position(current_price, "stop_loss")
             elif current_price >= pos.take_profit:
                 self._close_position(current_price, "take_profit")
-
-        else:  # short
+        else:
             if current_price < pos.lowest_price:
                 pos.lowest_price = current_price
-
             self._trail_short(pos, current_price)
-
             if current_price >= pos.stop_loss:
                 self._close_position(current_price, "stop_loss")
             elif current_price <= pos.take_profit:
@@ -414,6 +531,8 @@ class Trader:
         self.learner.learn()
         self._apply_learned_params()
 
+    # ── Trade journal ────────────────────────────────────────────────
+
     def _record_trade(self, pos: OpenPosition, exit_price: float, reason: str):
         leverage = self.config.hl_leverage
 
@@ -459,16 +578,18 @@ class Trader:
                 f"size={lp.confidence_scale:.2f}x tp={lp.target_pnl_pct}% sl={lp.max_loss_pct}%"
             )
 
+    # ── Main loop ────────────────────────────────────────────────────
+
     def run_loop(self):
         mode = "PAPER" if self.config.paper_trade else "LIVE"
         backend = self.config.exchange_backend.upper()
         symbol = self.config.hl_symbol if self.config.exchange_backend == "hyperliquid" else self.config.symbol
 
-        logger.info(f"Starting scalp bot [{mode}] on {backend} — {symbol}")
+        logger.info(f"Starting limit-order bot [{mode}] on {backend} — {symbol}")
         logger.info(
             f"Tick interval: {self.config.check_interval}s | "
             f"Level refresh: {self.config.level_refresh_seconds}s | "
-            f"Touch: {self.config.touch_pct}% | Approach: {self.config.approach_pct}%"
+            f"Max 1 limit order at highest-confidence level"
         )
 
         if self.notifier:
@@ -483,6 +604,9 @@ class Trader:
                 pos_info = ""
                 if summary["position_side"]:
                     pos_info = f" | {summary['position_side'].upper()} open"
+                elif summary["pending_orders"]:
+                    po = self.pending_order
+                    pos_info = f" | LIMIT {po.side.upper()} @ {po.price:.2f}"
                 logger.info(
                     f"Tick: {summary['current_price']:.2f} | "
                     f"Levels: {summary['levels_detected']}{pos_info}"
