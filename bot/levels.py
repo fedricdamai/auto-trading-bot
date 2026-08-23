@@ -27,8 +27,8 @@ TF_WEIGHTS = {"1d": 1.5, "4h": 1.0, "1h": 0.6, "5m": 0.3}
 MULTI_TF_CONFIGS = [
     {"timeframe": "1d", "lookback": 120},
     {"timeframe": "4h", "lookback": 200},
-    {"timeframe": "1h", "lookback": 200},
-    {"timeframe": "5m", "lookback": 200},
+    {"timeframe": "1h", "lookback": 500},
+    {"timeframe": "5m", "lookback": 500},
 ]
 
 

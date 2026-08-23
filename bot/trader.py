@@ -126,8 +126,14 @@ class Trader:
 
         self.known_levels = {l.price: l for l in levels}
 
-        support = [l for l in levels if l.kind == "support"]
-        resistance = [l for l in levels if l.kind == "resistance"]
+        support = sorted(
+            [l for l in levels if l.kind == "support"],
+            key=lambda l: abs(current_price - l.price),
+        )
+        resistance = sorted(
+            [l for l in levels if l.kind == "resistance"],
+            key=lambda l: abs(current_price - l.price),
+        )
 
         logger.info(
             f"Levels refreshed: {len(support)} support, {len(resistance)} resistance | "
@@ -135,7 +141,8 @@ class Trader:
         )
         for l in levels[:8]:
             tfs = ",".join(l.timeframes) if l.timeframes else "-"
-            logger.info(f"  {l.kind.upper():>10} {l.price:.2f} | str={l.strength} t={l.touches} [{tfs}]")
+            dist = abs(current_price - l.price) / current_price * 100
+            logger.info(f"  {l.kind.upper():>10} {l.price:.2f} | str={l.strength} t={l.touches} [{tfs}] {dist:.1f}%")
 
         if self.notifier:
             self.notifier.notify_levels(
@@ -190,12 +197,15 @@ class Trader:
             distance_pct = abs(current_price - level.price) / level.price * 100
             if distance_pct > 10:
                 continue
+            if distance_pct < 0.3:
+                continue
 
             weight = lp.support_weight if level.kind == "support" else lp.resistance_weight
             if weight < 0.4:
                 continue
 
-            effective_strength = level.strength * weight
+            proximity = 1.0 - (distance_pct / 15.0)
+            effective_strength = level.strength * weight * proximity
 
             doji = self.last_doji_signal
             if doji and doji.strength >= 50:
