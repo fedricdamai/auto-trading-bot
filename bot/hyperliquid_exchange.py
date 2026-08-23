@@ -111,7 +111,7 @@ class HyperliquidExchange:
         return self.info.user_state(self.address)
 
     def get_open_orders(self) -> list[dict]:
-        """Return open orders for the configured symbol."""
+        """Return open limit orders (non-trigger) for the configured symbol."""
         if self.config.paper_trade:
             return []
         try:
@@ -119,6 +119,17 @@ class HyperliquidExchange:
             return [o for o in orders if o.get("coin") == self.config.hl_symbol]
         except Exception as e:
             logger.error(f"Failed to get open orders: {e}")
+            return []
+
+    def get_all_open_orders(self) -> list[dict]:
+        """Return ALL open orders including trigger (TP/SL) orders."""
+        if self.config.paper_trade:
+            return []
+        try:
+            orders = self.info.frontend_open_orders(self.address)
+            return [o for o in orders if o.get("coin") == self.config.hl_symbol]
+        except Exception as e:
+            logger.error(f"Failed to get frontend open orders: {e}")
             return []
 
     def get_position(self) -> dict | None:
@@ -335,24 +346,24 @@ class HyperliquidExchange:
         return result
 
     def cancel_all_orders(self) -> int:
-        """Cancel all open orders for the configured symbol. Returns count cancelled."""
+        """Cancel ALL open orders (limit + trigger/TP/SL) for the symbol."""
         if self.config.paper_trade:
             return 0
 
-        orders = self.get_open_orders()
-        if not orders:
+        all_orders = self.get_all_open_orders()
+        if not all_orders:
             return 0
 
         cancel_requests = [
             {"coin": self.config.hl_symbol, "oid": int(o["oid"])}
-            for o in orders if o.get("oid") is not None
+            for o in all_orders if o.get("oid") is not None
         ]
         if not cancel_requests:
             return 0
 
         try:
             self.exchange.bulk_cancel(cancel_requests)
-            logger.info(f"[LIVE] Bulk cancelled {len(cancel_requests)} orders")
+            logger.info(f"[LIVE] Bulk cancelled {len(cancel_requests)} orders (incl. triggers)")
         except Exception as e:
             logger.error(f"Bulk cancel failed, cancelling individually: {e}")
             for req in cancel_requests:

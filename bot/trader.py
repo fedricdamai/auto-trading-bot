@@ -64,6 +64,7 @@ class Trader:
         self.last_doji_check: float = 0
         self.last_doji_signal: DojiSignal | None = None
         self.last_exit_time: float = 0
+        self._synced: bool = False
 
         self.journal = TradeJournal()
         self.learner = StrategyLearner(self.journal)
@@ -77,6 +78,10 @@ class Trader:
         """Single tick: check order/position state, refresh levels, act."""
         now = time.time()
         current_price = self.exchange.get_ticker_price()
+
+        if not self._synced:
+            self._sync_from_exchange(current_price)
+            self._synced = True
 
         if now - self.last_level_refresh >= self.config.level_refresh_seconds:
             self._refresh_levels(current_price)
@@ -101,6 +106,76 @@ class Trader:
             "open_positions": 1 if self.position else 0,
             "position_side": self.position.side if self.position else None,
         }
+
+    def _sync_from_exchange(self, current_price: float):
+        """One-time startup sync: recover state from exchange."""
+        if self.config.paper_trade:
+            return
+
+        position = self.exchange.get_position()
+        if position and position["size"] > 0:
+            entry = position["entry_price"]
+            side = position["side"]
+            kind = "support" if side == "long" else "resistance"
+            tpsl = compute_tp_sl(
+                entry, self.config.hl_leverage,
+                self.config.target_pnl_pct, self.config.max_loss_pct, side,
+            )
+            self.position = OpenPosition(
+                entry_price=entry,
+                quantity=position["size"],
+                side=side,
+                kind=kind,
+                level_price=entry,
+                stop_loss=tpsl["sl_price"],
+                take_profit=tpsl["tp_price"],
+                initial_sl=tpsl["sl_price"],
+                initial_tp=tpsl["tp_price"],
+                highest_price=current_price,
+                lowest_price=current_price,
+                strength=0,
+                filled_at=time.time(),
+            )
+            logger.info(
+                f"Synced position from exchange: {side} {position['size']} @ {entry} | "
+                f"SL: {tpsl['sl_price']:.2f} TP: {tpsl['tp_price']:.2f}"
+            )
+            return
+
+        open_orders = self.exchange.get_open_orders()
+        if not open_orders:
+            return
+
+        if len(open_orders) > 1:
+            cancelled = self.exchange.cancel_all_orders()
+            logger.info(f"Startup cleanup: cancelled {cancelled} duplicate orders")
+            return
+
+        o = open_orders[0]
+        price = float(o.get("limitPx", 0))
+        side_raw = o.get("side", "")
+        side = "long" if side_raw == "B" else "short"
+        kind = "support" if side == "long" else "resistance"
+        qty = float(o.get("sz", 0))
+        tpsl = compute_tp_sl(
+            price, self.config.hl_leverage,
+            self.config.target_pnl_pct, self.config.max_loss_pct, side,
+        )
+        self.pending_order = PendingOrder(
+            oid=o.get("oid"),
+            price=price,
+            quantity=qty,
+            side=side,
+            kind=kind,
+            level_price=price,
+            strength=0,
+            effective_strength=0,
+            timeframes=[],
+            stop_loss=tpsl["sl_price"],
+            take_profit=tpsl["tp_price"],
+            placed_at=time.time(),
+        )
+        logger.info(f"Synced pending order from exchange: {side} @ {price} oid={o.get('oid')}")
 
     # ── Level detection ──────────────────────────────────────────────
 
@@ -231,10 +306,13 @@ class Trader:
     # ── Limit order placement ────────────────────────────────────────
 
     def _place_best_order(self, current_price: float):
-        """Find the best level and place a single limit order there."""
+        """Ensure exactly 1 limit order at the best S/R level.
+
+        Uses the exchange as source of truth — checks real orders/position
+        every tick to prevent duplicates even after restarts.
+        """
         position = self.exchange.get_position()
         if position and position["size"] > 0:
-            logger.info(f"Already have {position['side']} position, skipping new order")
             return
 
         best_level, best_strength = self._find_best_level(current_price)
@@ -242,21 +320,18 @@ class Trader:
             return
 
         open_orders = self.exchange.get_open_orders()
-        if open_orders:
-            for o in open_orders:
-                existing_price = float(o.get("limitPx", 0))
-                if existing_price > 0:
-                    diff_pct = abs(best_level.price - existing_price) / existing_price * 100
-                    if diff_pct < 0.5:
-                        logger.info(
-                            f"Order already exists near {best_level.price:.2f} "
-                            f"(existing @ {existing_price:.2f}, diff {diff_pct:.2f}%), skipping"
-                        )
-                        return
 
-        cancelled = self.exchange.cancel_all_orders()
-        if cancelled:
-            logger.info(f"Cancelled {cancelled} stale orders before placing new one")
+        if len(open_orders) == 1:
+            existing_price = float(open_orders[0].get("limitPx", 0))
+            if existing_price > 0:
+                diff_pct = abs(best_level.price - existing_price) / existing_price * 100
+                if diff_pct < 0.5:
+                    return
+
+        if open_orders:
+            self.exchange.cancel_all_orders()
+            self.pending_order = None
+            logger.info(f"Cancelled {len(open_orders)} orders (stale/duplicate cleanup)")
 
         self._place_limit_order(current_price, best_level, best_strength)
 
@@ -419,7 +494,7 @@ class Trader:
             )
 
     def _reevaluate_pending_order(self, current_price: float):
-        """Cancel and replace if a significantly stronger level appeared."""
+        """Every 5min level refresh: re-validate thesis, replace if better level found."""
         order = self.pending_order
         if not order:
             return
@@ -429,11 +504,12 @@ class Trader:
             return
 
         if abs(best_level.price - order.level_price) / order.level_price < 0.002:
+            logger.info(f"Thesis validated: {order.kind} @ {order.level_price:.2f} still best")
             return
 
         if best_strength > order.effective_strength * 1.15:
             logger.info(
-                f"Replacing order: {order.kind} @ {order.level_price:.2f} "
+                f"Thesis changed — replacing: {order.kind} @ {order.level_price:.2f} "
                 f"(str {order.effective_strength:.1f}) -> "
                 f"{best_level.kind} @ {best_level.price:.2f} (str {best_strength:.1f})"
             )
@@ -441,15 +517,14 @@ class Trader:
             self._place_limit_order(current_price, best_level, best_strength)
 
     def _cancel_pending_order(self):
-        """Cancel the current pending order."""
+        """Cancel the current pending order (and any strays)."""
         order = self.pending_order
         if not order:
             return
 
-        if not self.config.paper_trade and order.oid is not None:
+        if not self.config.paper_trade:
             try:
-                self.exchange.cancel_order(order.price, order.oid)
-                logger.info(f"Cancelled order oid={order.oid}")
+                self.exchange.cancel_all_orders()
             except Exception as e:
                 logger.warning(f"Cancel failed (may be filled): {e}")
                 position = self.exchange.get_position()
