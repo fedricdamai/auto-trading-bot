@@ -51,8 +51,11 @@ class TelegramBot:
                 parse_mode=ParseMode.HTML,
             )
 
-    def notify_startup(self, symbol: str, timeframe: str, paper: bool, leverage: int = 1):
-        mode = "PAPER" if paper else "LIVE"
+    def notify_startup(self, symbol: str, timeframe: str, paper: bool, leverage: int = 1, mainnet: bool = False):
+        if paper:
+            mode = "PAPER"
+        else:
+            mode = "LIVE MAINNET" if mainnet else "LIVE TESTNET"
         self.send(
             f"<b>Scalp Bot Started [{mode}]</b>\n"
             f"Symbol: <code>{symbol}</code>\n"
@@ -156,7 +159,10 @@ class TelegramBot:
             price = 0
 
         levels = len(self.trader.known_levels)
-        mode = "PAPER" if self.trader.config.paper_trade else "LIVE"
+        if self.trader.config.paper_trade:
+            mode = "PAPER"
+        else:
+            mode = "LIVE MAINNET" if self.trader.config.hl_mainnet else "LIVE TESTNET"
 
         pos = self.trader.position
         if pos:
@@ -273,7 +279,10 @@ class TelegramBot:
             return
         c = self.trader.config
         symbol = c.hl_symbol if c.exchange_backend == "hyperliquid" else c.symbol
-        mode = "PAPER" if c.paper_trade else "LIVE"
+        if c.paper_trade:
+            mode = "PAPER"
+        else:
+            mode = "LIVE MAINNET" if c.hl_mainnet else "LIVE TESTNET"
         await update.message.reply_text(
             f"<b>Config</b>\n\n"
             f"Mode: <code>{mode}</code>\n"

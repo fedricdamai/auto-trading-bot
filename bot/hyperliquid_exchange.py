@@ -83,6 +83,31 @@ class HyperliquidExchange:
     def get_account_state(self) -> dict:
         return self.info.user_state(self.address)
 
+    def _parse_order_result(self, result: dict, expected_sz: float, mid_price: float) -> tuple[float, float]:
+        """Extract fill price and size from Hyperliquid order response."""
+        try:
+            statuses = result.get("response", {}).get("data", {}).get("statuses", [])
+            if not statuses:
+                raise ValueError(f"No order statuses in response: {result}")
+
+            status = statuses[0]
+
+            if "error" in status:
+                raise RuntimeError(f"Order rejected: {status['error']}")
+
+            if "filled" in status:
+                fill = status["filled"]
+                return float(fill.get("avgPx", mid_price)), float(fill.get("totalSz", expected_sz))
+
+            if "resting" in status:
+                return mid_price, expected_sz
+
+        except (AttributeError, TypeError, KeyError):
+            pass
+
+        logger.warning(f"Could not parse fill from response, using mid price: {result}")
+        return mid_price, expected_sz
+
     def place_market_buy(self, amount_quote: float) -> dict:
         price = self.get_ticker_price()
         quantity = round(amount_quote / price, 4)
@@ -108,15 +133,16 @@ class HyperliquidExchange:
             sz=quantity,
             slippage=0.01,
         )
-        logger.info(f"[LIVE] Market long placed: {result}")
+        fill_price, fill_sz = self._parse_order_result(result, quantity, price)
+        logger.info(f"[LIVE] Market long filled: {fill_sz} @ {fill_price:.2f}")
         return {
             "id": str(result),
             "symbol": self.config.hl_symbol,
             "side": "buy",
             "type": "market",
-            "amount": quantity,
-            "price": price,
-            "cost": amount_quote,
+            "amount": fill_sz,
+            "price": fill_price,
+            "cost": fill_sz * fill_price,
             "status": "filled",
             "paper": False,
             "raw": result,
@@ -147,15 +173,16 @@ class HyperliquidExchange:
             sz=quantity,
             slippage=0.01,
         )
-        logger.info(f"[LIVE] Market short placed: {result}")
+        fill_price, fill_sz = self._parse_order_result(result, quantity, price)
+        logger.info(f"[LIVE] Market short filled: {fill_sz} @ {fill_price:.2f}")
         return {
             "id": str(result),
             "symbol": self.config.hl_symbol,
             "side": "sell",
             "type": "market",
-            "amount": quantity,
-            "price": price,
-            "cost": amount_quote,
+            "amount": fill_sz,
+            "price": fill_price,
+            "cost": fill_sz * fill_price,
             "status": "filled",
             "paper": False,
             "raw": result,
@@ -184,14 +211,15 @@ class HyperliquidExchange:
             sz=quantity,
             slippage=0.01,
         )
-        logger.info(f"[LIVE] Market close {side} placed: {result}")
+        fill_price, fill_sz = self._parse_order_result(result, quantity, price)
+        logger.info(f"[LIVE] Market close {side} filled: {fill_sz} @ {fill_price:.2f}")
         return {
             "id": str(result),
             "symbol": self.config.hl_symbol,
             "side": "sell" if side == "long" else "buy",
             "type": "market",
-            "amount": quantity,
-            "price": price,
+            "amount": fill_sz,
+            "price": fill_price,
             "status": "filled",
             "paper": False,
             "raw": result,

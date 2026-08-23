@@ -474,7 +474,7 @@ class Trader:
         if self.notifier:
             self.notifier.notify_startup(
                 symbol, self.config.timeframe, self.config.paper_trade,
-                self.config.hl_leverage,
+                self.config.hl_leverage, self.config.hl_mainnet,
             )
 
         while True:
