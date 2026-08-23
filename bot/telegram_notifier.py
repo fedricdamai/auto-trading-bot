@@ -1,5 +1,6 @@
 import logging
 import asyncio
+import html
 import threading
 import time
 from collections import deque
@@ -61,7 +62,8 @@ class TelegramLogHandler(logging.Handler):
         self._buffer.clear()
         self._last_flush = now
         try:
-            self._send(f"<pre>{text[:3500]}</pre>")
+            safe = html.escape(text[:3500])
+            self._send(f"<pre>{safe}</pre>")
         except Exception:
             pass
 
@@ -385,6 +387,115 @@ class TelegramBot:
             f"Positions: <code>{len(positions)}/{max_pos}</code> | "
             f"Pending: <code>{len(pending_orders)}</code>"
             f"{pos_text}",
+            parse_mode=ParseMode.HTML,
+        )
+
+    async def _cmd_orders(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not self._is_authorized(update):
+            return
+        if not self.trader:
+            await update.message.reply_text("Bot not initialized yet.")
+            return
+
+        positions = self.trader.positions
+        pending = self.trader.pending_orders
+        lev = self.trader.config.hl_leverage
+
+        if not positions and not pending:
+            await update.message.reply_text("No open orders or positions.")
+            return
+
+        lines = ["<b>Orders & Positions</b>\n"]
+
+        for sym in sorted(set(list(positions.keys()) + list(pending.keys()))):
+            self.trader.exchange.switch_symbol(sym)
+            try:
+                price = self.trader.exchange.get_ticker_price()
+            except Exception:
+                price = 0
+
+            sym_levels = self.trader.known_levels.get(sym, {})
+            resistances = sorted(
+                [l for l in sym_levels.values() if l.kind == "resistance"],
+                key=lambda l: l.price,
+            )
+            supports = sorted(
+                [l for l in sym_levels.values() if l.kind == "support"],
+                key=lambda l: l.price, reverse=True,
+            )
+
+            lines.append(f"\n<b>--- {sym} ---</b>")
+
+            chart = []
+            pos = positions.get(sym)
+            pend = pending.get(sym)
+
+            if pos:
+                if pos.side == "long":
+                    pnl_pct = (price - pos.entry_price) / pos.entry_price * 100 * lev
+                else:
+                    pnl_pct = (pos.entry_price - price) / pos.entry_price * 100 * lev
+                sign = "+" if pnl_pct >= 0 else ""
+                chart.append((pos.take_profit, f"  TP   {pos.take_profit:.2f}  ............"))
+                chart.append((pos.entry_price, f"  {pos.side[0].upper()}    {pos.entry_price:.2f}  [{sign}{pnl_pct:.1f}%]"))
+                chart.append((pos.stop_loss, f"  SL   {pos.stop_loss:.2f}  ............"))
+
+            if pend:
+                label = "BUY" if pend.side == "long" else "SEL"
+                chart.append((pend.take_profit, f"  TP   {pend.take_profit:.2f}  ............"))
+                chart.append((pend.price, f"  {label}  {pend.price:.2f}  [pending]"))
+                chart.append((pend.stop_loss, f"  SL   {pend.stop_loss:.2f}  ............"))
+
+            for r in resistances[:2]:
+                chart.append((r.price, f"  R    {r.price:.2f}  str={r.strength}"))
+            for s in supports[:2]:
+                chart.append((s.price, f"  S    {s.price:.2f}  str={s.strength}"))
+
+            chart.append((price, f"  --&gt; {price:.2f} &lt;--  NOW"))
+
+            chart.sort(key=lambda x: x[0], reverse=True)
+
+            lines.append("<code>")
+            for _, line in chart:
+                lines.append(line)
+            lines.append("</code>")
+
+            if pend:
+                lines.append(f"  /cancel {sym} — cancel pending order")
+
+        self.trader.exchange.switch_symbol(self.trader.config.hl_symbol)
+        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+    async def _cmd_cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not self._is_authorized(update):
+            return
+        if not self.trader:
+            await update.message.reply_text("Bot not initialized yet.")
+            return
+
+        if not context.args:
+            symbols = list(self.trader.pending_orders.keys())
+            if not symbols:
+                await update.message.reply_text("No pending orders to cancel.")
+                return
+            await update.message.reply_text(
+                f"Usage: /cancel SYMBOL\n\nPending: {', '.join(symbols)}"
+            )
+            return
+
+        sym = context.args[0].upper()
+        if sym not in self.trader.pending_orders:
+            await update.message.reply_text(f"No pending order on {sym}.")
+            return
+
+        pend = self.trader.pending_orders[sym]
+        self.trader.exchange.switch_symbol(sym)
+        self.trader._cancel_pending_order(sym)
+        self.trader.exchange.switch_symbol(self.trader.config.hl_symbol)
+
+        await update.message.reply_text(
+            f"<b>Cancelled {sym}</b>\n"
+            f"Was: {pend.side.upper()} @ {pend.price:.2f}",
             parse_mode=ParseMode.HTML,
         )
 
@@ -956,6 +1067,8 @@ class TelegramBot:
         app.add_handler(CommandHandler("learn", self._cmd_learn))
         app.add_handler(CommandHandler("journal", self._cmd_journal))
         app.add_handler(CommandHandler("scan", self._cmd_scan))
+        app.add_handler(CommandHandler("orders", self._cmd_orders))
+        app.add_handler(CommandHandler("cancel", self._cmd_cancel))
         app.add_handler(CommandHandler("pause", self._cmd_pause))
         app.add_handler(CommandHandler("resume", self._cmd_resume))
         app.add_handler(CommandHandler("stop", self._cmd_stop))
