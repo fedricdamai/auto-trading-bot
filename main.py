@@ -2,7 +2,7 @@
 """Auto Trading Bot - Buys at support and resistance levels.
 
 Supports Hyperliquid (perps, 1x leverage) and ccxt exchanges.
-Optional Telegram notifications for trade alerts.
+Control and monitor via Telegram commands.
 """
 
 import logging
@@ -10,7 +10,7 @@ import sys
 
 from bot.config import Config
 from bot.trader import Trader
-from bot.telegram_notifier import TelegramNotifier
+from bot.telegram_notifier import TelegramBot
 
 
 def setup_logging(level: str):
@@ -48,22 +48,27 @@ def main():
     logger.info(f"  Backend:     {backend}")
     logger.info(f"  Symbol:      {symbol}")
     logger.info(f"  Timeframe:   {config.timeframe}")
-    logger.info(f"  Leverage:    {config.hl_leverage}x" if config.exchange_backend == "hyperliquid" else "")
+    if config.exchange_backend == "hyperliquid":
+        logger.info(f"  Leverage:    {config.hl_leverage}x")
     logger.info(f"  Order size:  {config.order_size} (quote)")
     logger.info(f"  Mode:        {mode}")
-    logger.info(f"  Stop loss:   {config.stop_loss_pct}%")
-    logger.info(f"  Take profit: {config.take_profit_pct}%")
     logger.info(f"  Telegram:    {'ON' if config.telegram_enabled else 'OFF'}")
     logger.info("=" * 60)
 
     exchange = build_exchange(config)
 
-    notifier = None
+    tg_bot = None
     if config.telegram_enabled:
-        notifier = TelegramNotifier(config.tg_bot_token, config.tg_chat_id)
-        logger.info("Telegram notifications enabled")
+        tg_bot = TelegramBot(config.tg_bot_token, config.tg_chat_id)
+        logger.info("Telegram bot enabled")
 
-    trader = Trader(config, exchange, notifier)
+    trader = Trader(config, exchange, tg_bot)
+
+    if tg_bot:
+        tg_bot.set_trader(trader)
+        tg_bot.start_command_listener()
+        logger.info("Telegram commands active: /status /levels /orders /pnl /config /help")
+
     trader.run_loop()
 
 
