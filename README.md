@@ -1,16 +1,17 @@
 # Auto Trading Bot - Support & Resistance Levels
 
-An automated trading bot that detects support and resistance levels from historical price data and places buy orders when price approaches those levels.
+An automated trading bot that detects and scores support/resistance levels from 4H candle data, places limit orders at the strongest levels, and manages positions with dynamic risk parameters.
 
 Supports **Hyperliquid** (decentralized perps, 1x leverage) and **ccxt** exchanges (Binance, etc.), with optional **Telegram** alerts.
 
 ## How it works
 
-1. **Fetches candle data** from Hyperliquid or any ccxt exchange
-2. **Detects support/resistance levels** using swing-point analysis and price clustering
-3. **Places buy orders** when price is within tolerance of a confirmed level
-4. **Manages positions** with configurable stop-loss and take-profit
-5. **Sends Telegram alerts** on trades, exits, and errors (optional)
+1. **Detects levels** from 4H candles using swing-point analysis, wick detection, and price clustering
+2. **Scores each level (0-100)** based on touch count, volume, recency, and rejection strength
+3. **Places limit buy orders** at the strongest levels (support bounce + resistance breakout)
+4. **Dynamic risk**: tighter SL on stronger levels, minimum 2:1 reward-to-risk
+5. **Self-cleans**: cancels stale orders and orders at invalidated levels
+6. **Telegram alerts** on every trade, exit, and error (optional)
 
 ## Setup
 
@@ -22,7 +23,7 @@ cp .env.example .env
 
 ### Hyperliquid setup
 
-1. Get your wallet address and private key from your Hyperliquid account
+1. Get your wallet address and private key (MetaMask or similar)
 2. Set `EXCHANGE_BACKEND=hyperliquid` in `.env`
 3. Set `HL_WALLET_ADDRESS` and `HL_PRIVATE_KEY`
 4. Start with `HL_MAINNET=false` (testnet) and `PAPER_TRADE=true`
@@ -42,16 +43,21 @@ All settings are in `.env` (see `.env.example`):
 | `EXCHANGE_BACKEND` | `hyperliquid` or `ccxt` | `hyperliquid` |
 | `HL_SYMBOL` | Hyperliquid asset name | `BTC` |
 | `HL_LEVERAGE` | Leverage multiplier | `1` |
-| `TIMEFRAME` | Candle timeframe | `1h` |
+| `TIMEFRAME` | Candle timeframe | `4h` |
 | `ORDER_SIZE` | Buy size in quote currency | `50` |
-| `STOP_LOSS_PCT` | Stop loss % | `2.0` |
-| `TAKE_PROFIT_PCT` | Take profit % | `4.0` |
+| `MAX_OPEN_ORDERS` | Max simultaneous limit orders | `5` |
+| `ORDER_TTL_HOURS` | Cancel unfilled orders after | `24` |
 | `PAPER_TRADE` | Simulate orders | `true` |
 
-## Run
+## Deploy on a VPS
 
 ```bash
-python main.py
+git clone https://github.com/fedricdamai/auto-trading-bot.git
+cd auto-trading-bot
+bash setup.sh
+nano .env       # fill in your keys
+sudo systemctl start tradingbot
+journalctl -u tradingbot -f
 ```
 
 ## Tests
