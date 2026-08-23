@@ -25,8 +25,8 @@ class Config:
     hl_mainnet: bool = os.getenv("HL_MAINNET", "false").lower() == "true"
 
     # Multi-symbol scanning
-    hl_multi_symbol: bool = os.getenv("HL_MULTI_SYMBOL", "false").lower() == "true"
-    hl_symbols: str = os.getenv("HL_SYMBOLS", "")  # comma-separated, e.g. "BTC,ETH,SOL"
+    hl_multi_symbol: bool = os.getenv("HL_MULTI_SYMBOL", "true").lower() == "true"
+    hl_symbols: str = os.getenv("HL_SYMBOLS", "BTC,ETH,SOL,HYPE,BNB")
     hl_scan_top_n: int = int(os.getenv("HL_SCAN_TOP_N", "10"))
 
     # Shared trading settings
