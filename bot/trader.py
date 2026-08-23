@@ -31,6 +31,9 @@ class OpenPosition:
     level_price: float
     stop_loss: float
     take_profit: float
+    initial_sl: float = 0.0
+    initial_tp: float = 0.0
+    highest_price: float = 0.0
 
 
 class Trader:
@@ -226,6 +229,9 @@ class Trader:
                     level_price=pending.level_price,
                     stop_loss=pending.stop_loss,
                     take_profit=pending.take_profit,
+                    initial_sl=pending.stop_loss,
+                    initial_tp=pending.take_profit,
+                    highest_price=pending.entry_price,
                 )
                 self.open_positions.append(position)
                 logger.info(
@@ -238,29 +244,88 @@ class Trader:
         self.pending_orders = remaining
 
     def _manage_positions(self, current_price: float):
-        """Check SL/TP on open positions."""
+        """Check SL/TP on open positions with smart trailing based on S/R levels."""
         remaining = []
         for pos in self.open_positions:
+            # Track highest price for trailing logic
+            if current_price > pos.highest_price:
+                pos.highest_price = current_price
+
+            # Adapt TP/SL using live S/R levels
+            self._adapt_tp_sl(pos, current_price)
+
+            margin_pnl = (current_price - pos.entry_price) / pos.entry_price * 100 * self.config.hl_leverage
+
             if current_price <= pos.stop_loss:
-                pnl_pct = (current_price - pos.entry_price) / pos.entry_price * 100
+                price_pnl = (current_price - pos.entry_price) / pos.entry_price * 100
                 logger.info(
                     f"STOP LOSS — {pos.kind} @ {pos.entry_price:.2f} | "
-                    f"Exit: {current_price:.2f} | PnL: {pnl_pct:+.2f}%"
+                    f"Exit: {current_price:.2f} | PnL: {price_pnl:+.2f}% price, {margin_pnl:+.2f}% margin"
                 )
                 if self.notifier:
-                    self.notifier.notify_exit("stop_loss", pos.level_price, pos.kind, current_price)
+                    self.notifier.notify_exit("stop_loss", pos.level_price, pos.kind, current_price, pos.entry_price, leverage)
             elif current_price >= pos.take_profit:
-                pnl_pct = (current_price - pos.entry_price) / pos.entry_price * 100
+                price_pnl = (current_price - pos.entry_price) / pos.entry_price * 100
                 logger.info(
                     f"TAKE PROFIT — {pos.kind} @ {pos.entry_price:.2f} | "
-                    f"Exit: {current_price:.2f} | PnL: {pnl_pct:+.2f}%"
+                    f"Exit: {current_price:.2f} | PnL: {price_pnl:+.2f}% price, {margin_pnl:+.2f}% margin"
                 )
                 if self.notifier:
-                    self.notifier.notify_exit("take_profit", pos.level_price, pos.kind, current_price)
+                    self.notifier.notify_exit("take_profit", pos.level_price, pos.kind, current_price, pos.entry_price, leverage)
             else:
                 remaining.append(pos)
 
         self.open_positions = remaining
+
+    def _adapt_tp_sl(self, pos: OpenPosition, current_price: float):
+        """Adjust TP/SL based on live S/R levels and price movement.
+
+        Rules:
+        1. Trail SL up to nearest support below current price (never lower SL)
+        2. If price passed original TP, move TP to next resistance above
+        3. Once in profit, move SL to breakeven then trail with support
+        """
+        if not self.known_levels:
+            return
+
+        leverage = self.config.hl_leverage
+        levels_sorted = sorted(self.known_levels.values(), key=lambda l: l.price)
+
+        # Find nearest support below current price
+        supports_below = [l for l in levels_sorted if l.kind == "support" and l.price < current_price]
+        # Find nearest resistance above current price
+        resistances_above = [l for l in levels_sorted if l.kind == "resistance" and l.price > current_price]
+
+        # Rule 1: Trail SL up to nearest support (never lower it)
+        if supports_below:
+            nearest_support = supports_below[-1].price
+            # Only move SL up if the support is above current SL and below entry
+            # (or above entry if we're trailing in profit)
+            if nearest_support > pos.stop_loss:
+                old_sl = pos.stop_loss
+                pos.stop_loss = round(nearest_support * 0.998, 2)  # just below support
+                if pos.stop_loss > old_sl:
+                    logger.info(
+                        f"  SL trailed: {old_sl:.2f} → {pos.stop_loss:.2f} "
+                        f"(support @ {nearest_support:.2f})"
+                    )
+
+        # Rule 2: Breakeven stop — once profit exceeds target, lock in entry
+        profit_pct = (current_price - pos.entry_price) / pos.entry_price * 100 * leverage
+        if profit_pct >= self.config.target_pnl_pct and pos.stop_loss < pos.entry_price:
+            pos.stop_loss = round(pos.entry_price * 1.001, 2)  # just above entry
+            logger.info(f"  SL moved to breakeven: {pos.stop_loss:.2f}")
+
+        # Rule 3: Extend TP to next resistance if price already passed original TP level
+        if resistances_above and current_price >= pos.initial_tp * 0.995:
+            next_resistance = resistances_above[0].price
+            if next_resistance > pos.take_profit:
+                old_tp = pos.take_profit
+                pos.take_profit = round(next_resistance * 0.998, 2)  # just below resistance
+                logger.info(
+                    f"  TP extended: {old_tp:.2f} → {pos.take_profit:.2f} "
+                    f"(resistance @ {next_resistance:.2f})"
+                )
 
     def run_loop(self):
         mode = "PAPER" if self.config.paper_trade else "LIVE"

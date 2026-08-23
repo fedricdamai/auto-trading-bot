@@ -91,13 +91,20 @@ class TelegramBot:
             f"SL: <code>{sl:.2f}</code> | TP: <code>{tp:.2f}</code>"
         )
 
-    def notify_exit(self, reason: str, level: float, level_type: str, price: float):
+    def notify_exit(self, reason: str, level: float, level_type: str, price: float, entry: float = 0, leverage: int = 1):
         label = "STOP LOSS" if reason == "stop_loss" else "TAKE PROFIT"
-        self.send(
-            f"<b>{label} HIT</b>\n"
+        emoji = "🔴" if reason == "stop_loss" else "🟢"
+        msg = (
+            f"<b>{emoji} {label} HIT</b>\n"
             f"Level: <code>{level:.2f}</code> ({level_type})\n"
             f"Exit price: <code>{price:.2f}</code>"
         )
+        if entry > 0:
+            price_pnl = (price - entry) / entry * 100
+            margin_pnl = price_pnl * leverage
+            sign = "+" if margin_pnl >= 0 else ""
+            msg += f"\nMargin PnL: <code>{sign}{margin_pnl:.2f}%</code> ({leverage}x)"
+        self.send(msg)
 
     def notify_error(self, error: str):
         self.send(f"<b>Error</b>\n<code>{error[:500]}</code>")
@@ -222,17 +229,27 @@ class TelegramBot:
             await update.message.reply_text("Could not fetch current price.")
             return
 
-        lines = ["<b>Open Positions</b>\n"]
+        lev = self.trader.config.hl_leverage
+        lines = [f"<b>Open Positions ({lev}x)</b>\n"]
         total_pnl = 0
         for i, pos in enumerate(self.trader.open_positions, 1):
-            pnl_pct = (price - pos.entry_price) / pos.entry_price * 100
-            pnl_usd = pos.quantity * (price - pos.entry_price)
+            price_pnl = (price - pos.entry_price) / pos.entry_price * 100
+            margin_pnl = price_pnl * lev
+            pnl_usd = pos.quantity * (price - pos.entry_price) * lev
             total_pnl += pnl_usd
-            sign = "+" if pnl_pct >= 0 else ""
+            sign = "+" if margin_pnl >= 0 else ""
+
+            sl_moved = pos.stop_loss != pos.initial_sl
+            sl_tag = " (trailed)" if sl_moved else ""
+            tp_moved = pos.take_profit != pos.initial_tp
+            tp_tag = " (extended)" if tp_moved else ""
+
             lines.append(
                 f"{i}. Entry: <code>{pos.entry_price:.2f}</code> ({pos.kind})\n"
-                f"   Now: <code>{price:.2f}</code> | PnL: <code>{sign}{pnl_pct:.2f}%</code> ({sign}{pnl_usd:.2f})\n"
-                f"   SL: <code>{pos.stop_loss:.2f}</code> | TP: <code>{pos.take_profit:.2f}</code>"
+                f"   Now: <code>{price:.2f}</code>\n"
+                f"   Margin PnL: <code>{sign}{margin_pnl:.2f}%</code> ({sign}{pnl_usd:.2f})\n"
+                f"   SL: <code>{pos.stop_loss:.2f}</code>{sl_tag}\n"
+                f"   TP: <code>{pos.take_profit:.2f}</code>{tp_tag}"
             )
 
         sign = "+" if total_pnl >= 0 else ""
