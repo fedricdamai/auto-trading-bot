@@ -195,6 +195,51 @@ class HyperliquidExchange:
             logger.error(f"Failed to get open orders for {symbol}: {e}")
             return []
 
+    def get_trigger_orders_for_symbol(self, symbol: str) -> list[dict]:
+        """Return trigger (TP/SL) orders for a specific symbol."""
+        if self.config.paper_trade:
+            return []
+        try:
+            orders = self.info.frontend_open_orders(self.address)
+            return [
+                o for o in orders
+                if o.get("coin") == symbol and o.get("orderType", "").startswith("Trigger")
+            ]
+        except Exception as e:
+            logger.error(f"Failed to get trigger orders for {symbol}: {e}")
+            return []
+
+    def cancel_trigger_orders_for_symbol(self, symbol: str) -> int:
+        """Cancel only trigger (TP/SL) orders for a symbol, leaving limit orders."""
+        if self.config.paper_trade:
+            return 0
+        triggers = self.get_trigger_orders_for_symbol(symbol)
+        if not triggers:
+            return 0
+        cancel_requests = [
+            {"coin": symbol, "oid": int(o["oid"])}
+            for o in triggers if o.get("oid") is not None
+        ]
+        if not cancel_requests:
+            return 0
+        try:
+            self.exchange.bulk_cancel(cancel_requests)
+            logger.info(f"[LIVE] Cancelled {len(cancel_requests)} trigger orders on {symbol}")
+        except Exception as e:
+            logger.error(f"Trigger cancel failed for {symbol}: {e}")
+            for req in cancel_requests:
+                try:
+                    self.exchange.cancel(name=symbol, oid=req["oid"])
+                except Exception:
+                    pass
+        return len(cancel_requests)
+
+    def update_tp_sl_orders(self, quantity: float, side: str, tp_price: float, sl_price: float) -> dict:
+        """Cancel existing TP/SL triggers and place new ones at updated prices."""
+        symbol = self.config.hl_symbol
+        self.cancel_trigger_orders_for_symbol(symbol)
+        return self.place_tp_sl_orders(quantity, side, tp_price, sl_price)
+
     def cancel_orders_for_symbol(self, symbol: str) -> int:
         """Cancel ALL open orders (limit + trigger) for a specific symbol."""
         if self.config.paper_trade:

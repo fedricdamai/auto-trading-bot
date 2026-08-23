@@ -210,6 +210,19 @@ class Trader:
                 f"SL: {tpsl['sl_price']:.2f} TP: {tpsl['tp_price']:.2f}"
             )
 
+            if hasattr(self.exchange, 'get_trigger_orders_for_symbol'):
+                existing_triggers = self.exchange.get_trigger_orders_for_symbol(sym)
+                if not existing_triggers:
+                    try:
+                        self.exchange.place_tp_sl_orders(
+                            pos_data["size"], side, tpsl["tp_price"], tpsl["sl_price"],
+                        )
+                        logger.info(f"[{sym}] TP/SL triggers placed for synced position")
+                    except Exception as e:
+                        logger.error(f"[{sym}] Failed to place TP/SL for synced position: {e}")
+                else:
+                    logger.info(f"[{sym}] {len(existing_triggers)} trigger orders already exist")
+
         for sym in self._get_symbols():
             if sym in self.positions:
                 continue
@@ -670,7 +683,7 @@ class Trader:
         if self.notifier:
             self.notifier.notify_entry(
                 side, level.price, f"{symbol} {level.kind}", fill_price, quantity,
-                tpsl["sl_price"], tpsl["tp_price"], leverage,
+                tpsl["sl_price"], tpsl["tp_price"], self.config.hl_leverage,
             )
 
     def _reevaluate_pending_order(self, symbol: str, current_price: float):
@@ -745,8 +758,10 @@ class Trader:
         if not levels:
             return
 
-        leverage = self.config.hl_leverage
+        leverage = pos.leverage
         levels_sorted = sorted(levels.values(), key=lambda l: l.price)
+        old_sl = pos.stop_loss
+        old_tp = pos.take_profit
 
         supports_below = [l for l in levels_sorted if l.kind == "support" and l.price < current_price]
         resistances_above = [l for l in levels_sorted if l.kind == "resistance" and l.price > current_price]
@@ -766,12 +781,17 @@ class Trader:
             if next_resistance > pos.take_profit:
                 pos.take_profit = round(next_resistance * 0.998, 2)
 
+        if (pos.stop_loss != old_sl or pos.take_profit != old_tp):
+            self._sync_tp_sl_to_exchange(pos)
+
     def _trail_short(self, pos: OpenPosition, current_price: float, levels: dict):
         if not levels:
             return
 
-        leverage = self.config.hl_leverage
+        leverage = pos.leverage
         levels_sorted = sorted(levels.values(), key=lambda l: l.price)
+        old_sl = pos.stop_loss
+        old_tp = pos.take_profit
 
         resistances_above = [l for l in levels_sorted if l.kind == "resistance" and l.price > current_price]
         supports_below = [l for l in levels_sorted if l.kind == "support" and l.price < current_price]
@@ -791,12 +811,33 @@ class Trader:
             if next_support < pos.take_profit:
                 pos.take_profit = round(next_support * 1.002, 2)
 
+        if (pos.stop_loss != old_sl or pos.take_profit != old_tp):
+            self._sync_tp_sl_to_exchange(pos)
+
+    def _sync_tp_sl_to_exchange(self, pos: OpenPosition):
+        """Update TP/SL trigger orders on the exchange after trailing."""
+        if self.config.paper_trade:
+            return
+        if not hasattr(self.exchange, 'update_tp_sl_orders'):
+            return
+        try:
+            self.exchange.switch_symbol(pos.symbol)
+            self.exchange.update_tp_sl_orders(
+                pos.quantity, pos.side, pos.take_profit, pos.stop_loss,
+            )
+            logger.info(
+                f"[{pos.symbol}] TP/SL triggers updated: "
+                f"TP={pos.take_profit:.2f} SL={pos.stop_loss:.2f}"
+            )
+        except Exception as e:
+            logger.error(f"[{pos.symbol}] Failed to update TP/SL triggers: {e}")
+
     def _close_position(self, symbol: str, exit_price: float, reason: str):
         pos = self.positions.get(symbol)
         if not pos:
             return
 
-        leverage = self.config.hl_leverage
+        leverage = pos.leverage
 
         if pos.side == "long":
             price_pnl = (exit_price - pos.entry_price) / pos.entry_price * 100
@@ -838,7 +879,7 @@ class Trader:
     # ── Trade journal ────────────────────────────────────────────────
 
     def _record_trade(self, pos: OpenPosition, exit_price: float, reason: str):
-        leverage = self.config.hl_leverage
+        leverage = pos.leverage
 
         if pos.side == "long":
             price_pnl = (exit_price - pos.entry_price) / pos.entry_price * 100
