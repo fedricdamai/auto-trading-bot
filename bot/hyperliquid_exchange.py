@@ -51,7 +51,7 @@ class HyperliquidExchange:
         if price == 0:
             return 0.0
         d = sig_figs - 1 - int(math.floor(math.log10(abs(price))))
-        return round(price, max(d, 0))
+        return round(price, d)
 
     def _round_size(self, size: float) -> float:
         """Round size to the exchange's szDecimals."""
@@ -280,12 +280,14 @@ class HyperliquidExchange:
                 "status": "open", "paper": True,
             }
 
+        logger.info(f"[LIVE] Submitting limit buy: price={price} sz={quantity} (szDec={self._sz_decimals})")
         result = self.exchange.order(
             name=self.config.hl_symbol, is_buy=True, sz=quantity,
             limit_px=price, order_type={"limit": {"tif": "Gtc"}},
         )
+        logger.debug(f"[LIVE] Limit buy raw response: {result}")
         parsed = self._parse_limit_result(result, price, quantity)
-        logger.info(f"[LIVE] Limit buy @ {price:.2f}: oid={parsed['oid']} status={parsed['status']}")
+        logger.info(f"[LIVE] Limit buy @ {price}: oid={parsed['oid']} status={parsed['status']}")
         return {
             "id": str(result), "oid": parsed["oid"],
             "symbol": self.config.hl_symbol, "side": "buy", "type": "limit",
@@ -308,12 +310,14 @@ class HyperliquidExchange:
                 "status": "open", "paper": True,
             }
 
+        logger.info(f"[LIVE] Submitting limit sell: price={price} sz={quantity} (szDec={self._sz_decimals})")
         result = self.exchange.order(
             name=self.config.hl_symbol, is_buy=False, sz=quantity,
             limit_px=price, order_type={"limit": {"tif": "Gtc"}},
         )
+        logger.debug(f"[LIVE] Limit sell raw response: {result}")
         parsed = self._parse_limit_result(result, price, quantity)
-        logger.info(f"[LIVE] Limit sell @ {price:.2f}: oid={parsed['oid']} status={parsed['status']}")
+        logger.info(f"[LIVE] Limit sell @ {price}: oid={parsed['oid']} status={parsed['status']}")
         return {
             "id": str(result), "oid": parsed["oid"],
             "symbol": self.config.hl_symbol, "side": "sell", "type": "limit",

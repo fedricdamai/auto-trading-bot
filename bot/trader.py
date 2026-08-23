@@ -283,9 +283,9 @@ class Trader:
                 )
 
         except Exception as e:
-            logger.error(f"Failed to place limit {side}: {e}")
+            logger.error(f"Failed to place limit {side} at {entry_price} (size ${order_size}): {e}")
             if self.notifier:
-                self.notifier.notify_error(f"Limit {side} failed: {e}")
+                self.notifier.notify_error(f"Limit {side} failed at {entry_price}: {e}")
 
     # ── Pending order management ─────────────────────────────────────
 
