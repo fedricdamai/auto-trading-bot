@@ -1,4 +1,5 @@
 import logging
+import math
 import time
 import pandas as pd
 from eth_account import Account
@@ -21,6 +22,7 @@ class HyperliquidExchange:
         base_url = constants.MAINNET_API_URL if config.hl_mainnet else constants.TESTNET_API_URL
 
         self.info = Info(base_url, skip_ws=True)
+        self._sz_decimals = self._get_sz_decimals()
 
         if config.paper_trade:
             self.exchange = None
@@ -29,6 +31,31 @@ class HyperliquidExchange:
             account = Account.from_key(config.hl_private_key)
             self.exchange = HLExchange(account, base_url)
             self._set_leverage()
+
+    def _get_sz_decimals(self) -> int:
+        """Get size decimal places for the configured symbol from exchange metadata."""
+        try:
+            meta = self.info.meta()
+            for asset in meta.get("universe", []):
+                if asset.get("name") == self.config.hl_symbol:
+                    sd = asset.get("szDecimals", 5)
+                    logger.info(f"{self.config.hl_symbol} szDecimals={sd}")
+                    return sd
+        except Exception as e:
+            logger.warning(f"Failed to get szDecimals, defaulting to 5: {e}")
+        return 5
+
+    @staticmethod
+    def _round_price(price: float, sig_figs: int = 5) -> float:
+        """Round price to N significant figures (Hyperliquid requires <= 5)."""
+        if price == 0:
+            return 0.0
+        d = sig_figs - 1 - int(math.floor(math.log10(abs(price))))
+        return round(price, max(d, 0))
+
+    def _round_size(self, size: float) -> float:
+        """Round size to the exchange's szDecimals."""
+        return round(size, self._sz_decimals)
 
     def _set_leverage(self):
         if self.exchange is None:
@@ -168,7 +195,7 @@ class HyperliquidExchange:
 
     def place_market_buy(self, amount_quote: float) -> dict:
         price = self.get_ticker_price()
-        quantity = round(amount_quote / price, 4)
+        quantity = self._round_size(amount_quote / price)
 
         if self.config.paper_trade:
             logger.info(f"[PAPER] Long {quantity} {self.config.hl_symbol} @ {price:.2f}")
@@ -192,7 +219,7 @@ class HyperliquidExchange:
 
     def place_market_short(self, amount_quote: float) -> dict:
         price = self.get_ticker_price()
-        quantity = round(amount_quote / price, 4)
+        quantity = self._round_size(amount_quote / price)
 
         if self.config.paper_trade:
             logger.info(f"[PAPER] Short {quantity} {self.config.hl_symbol} @ {price:.2f}")
@@ -216,6 +243,7 @@ class HyperliquidExchange:
 
     def place_market_close(self, quantity: float, side: str = "long") -> dict:
         price = self.get_ticker_price()
+        quantity = self._round_size(quantity)
 
         if self.config.paper_trade:
             close_side = "sell" if side == "long" else "buy"
@@ -240,7 +268,8 @@ class HyperliquidExchange:
 
     def place_limit_buy(self, price: float, amount_quote: float) -> dict:
         """Place a limit buy (long entry) order."""
-        quantity = round(amount_quote / price, 4)
+        price = self._round_price(price)
+        quantity = self._round_size(amount_quote / price)
 
         if self.config.paper_trade:
             logger.info(f"[PAPER] Limit buy {quantity} {self.config.hl_symbol} @ {price:.2f}")
@@ -267,7 +296,8 @@ class HyperliquidExchange:
 
     def place_limit_sell(self, price: float, amount_quote: float) -> dict:
         """Place a limit sell (short entry) order."""
-        quantity = round(amount_quote / price, 4)
+        price = self._round_price(price)
+        quantity = self._round_size(amount_quote / price)
 
         if self.config.paper_trade:
             logger.info(f"[PAPER] Limit sell {quantity} {self.config.hl_symbol} @ {price:.2f}")
