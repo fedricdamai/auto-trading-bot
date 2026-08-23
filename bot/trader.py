@@ -75,6 +75,8 @@ class Trader:
         self.last_scan_time: float = 0
         self.scan_interval: int = 300
         self.max_positions: int = config.hl_max_positions
+        self.paused: bool = False
+        self.running: bool = True
 
         if config.hl_multi_symbol and hasattr(exchange, "info"):
             self.scanner = MarketScanner(exchange.info, config)
@@ -141,7 +143,7 @@ class Trader:
             except Exception as e:
                 logger.error(f"Error checking {sym} pending order: {e}")
 
-        if now - self.last_exit_time >= self.config.cooldown_seconds:
+        if not self.paused and now - self.last_exit_time >= self.config.cooldown_seconds:
             active_count = len(self.positions) + len(self.pending_orders)
             if active_count < self.max_positions:
                 self._scan_and_place(symbols)
@@ -837,7 +839,7 @@ class Trader:
                 self.config.hl_leverage, self.config.hl_mainnet,
             )
 
-        while True:
+        while self.running:
             try:
                 summary = self.run_once()
                 pos_info = ""
@@ -846,12 +848,17 @@ class Trader:
                 elif summary["pending_orders"]:
                     pends = [f"{s}:{o.side}@{o.price:.0f}" for s, o in self.pending_orders.items()]
                     pos_info = f" | Pending: {', '.join(pends)}"
+                paused_tag = " [PAUSED]" if self.paused else ""
                 logger.info(
                     f"Tick: levels={summary['levels_detected']} "
-                    f"pos={summary['open_positions']} pend={summary['pending_orders']}{pos_info}"
+                    f"pos={summary['open_positions']} pend={summary['pending_orders']}{pos_info}{paused_tag}"
                 )
             except Exception as e:
                 logger.error(f"Tick error: {e}")
                 if self.notifier:
                     self.notifier.notify_error(str(e))
             time.sleep(self.config.check_interval)
+
+        logger.info("Bot stopped via /stop command")
+        if self.notifier:
+            self.notifier.send("<b>Bot stopped.</b> Restart with systemctl.")

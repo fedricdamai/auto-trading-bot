@@ -73,8 +73,10 @@ def main():
 
     if tg_bot:
         tg_bot.set_trader(trader)
+        tg_log_handler = tg_bot.get_log_handler()
+        logging.getLogger().addHandler(tg_log_handler)
         tg_bot.start_command_listener()
-        logger.info("Telegram commands active: /status /levels /orders /pnl /config /help")
+        logger.info("Telegram commands active — /logs to control log streaming")
 
     trader.run_loop()
 

@@ -1,6 +1,8 @@
 import logging
 import asyncio
 import threading
+import time
+from collections import deque
 from telegram import Bot, Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 from telegram.constants import ParseMode
@@ -8,6 +10,60 @@ from telegram.constants import ParseMode
 from bot.levels import compute_tp_sl
 
 logger = logging.getLogger(__name__)
+
+# Keywords that make an INFO message worth forwarding to Telegram
+_KEY_PATTERNS = (
+    "FILLED", "LIMIT ", "DECISION", "SKIP", "CANCEL", "STOP LOSS",
+    "TAKE PROFIT", "Startup", "Synced", "cleanup", "position",
+    "Tick:", "ERROR", "WARNING", "Level",
+)
+
+
+class TelegramLogHandler(logging.Handler):
+    """Logging handler that forwards important messages to Telegram."""
+
+    def __init__(self, bot_send_fn, level=logging.INFO):
+        super().__init__(level)
+        self._send = bot_send_fn
+        self._buffer: list[str] = []
+        self._last_flush = 0.0
+        self._flush_interval = 5.0
+        self._verbose = False
+
+    @property
+    def verbose(self):
+        return self._verbose
+
+    @verbose.setter
+    def verbose(self, val: bool):
+        self._verbose = val
+
+    def emit(self, record: logging.LogRecord):
+        try:
+            msg = self.format(record)
+            if record.levelno >= logging.WARNING:
+                self._buffer.append(msg)
+                self._try_flush()
+                return
+            if self._verbose or any(p in msg for p in _KEY_PATTERNS):
+                self._buffer.append(msg)
+                self._try_flush()
+        except Exception:
+            pass
+
+    def _try_flush(self):
+        now = time.time()
+        if not self._buffer:
+            return
+        if now - self._last_flush < self._flush_interval and len(self._buffer) < 10:
+            return
+        text = "\n".join(self._buffer[-20:])
+        self._buffer.clear()
+        self._last_flush = now
+        try:
+            self._send(f"<pre>{text[:3500]}</pre>")
+        except Exception:
+            pass
 
 
 class TelegramBot:
@@ -21,9 +77,17 @@ class TelegramBot:
         self.allowed_users = allowed_users or set()
         self._app = None
         self._loop = None
+        self._log_handler: TelegramLogHandler | None = None
 
     def set_trader(self, trader):
         self.trader = trader
+
+    def get_log_handler(self) -> TelegramLogHandler:
+        if not self._log_handler:
+            self._log_handler = TelegramLogHandler(self.send)
+            fmt = logging.Formatter("%(asctime)s [%(levelname).1s] %(name)s: %(message)s", datefmt="%H:%M:%S")
+            self._log_handler.setFormatter(fmt)
+        return self._log_handler
 
     def _is_authorized(self, update: Update) -> bool:
         user_id = update.effective_user.id
@@ -214,21 +278,31 @@ class TelegramBot:
             return
         await update.message.reply_text(
             "<b>Scalp Trading Bot</b>\n\n"
+            "<b>Control:</b>\n"
+            "/pause - Stop placing new orders\n"
+            "/resume - Resume trading\n"
+            "/stop - Stop bot (force to ignore open positions)\n"
+            "/closeall - Close all positions & orders\n\n"
             "<b>Monitor:</b>\n"
-            "/status - Bot status & position\n"
-            "/levels - Current support & resistance\n"
-            "/pnl - Position P&L\n"
-            "/config - Current settings\n\n"
-            "<b>Risk management:</b>\n"
-            "/risk - Show TP/SL & leverage info\n"
-            "/settp 1.5 - Set target profit %\n"
-            "/setsl 0.5 - Set max loss %\n"
-            "/setlev 3 - Set leverage (1-5)\n\n"
-            "<b>Multi-symbol:</b>\n"
+            "/status - Bot status & all positions\n"
+            "/pnl - All positions P&L\n"
+            "/levels - S/R levels per symbol\n"
             "/scan - Scan all markets\n\n"
-            "<b>Learning:</b>\n"
-            "/learn - What the bot has learned\n"
-            "/journal - Recent trade history\n\n"
+            "<b>Config (live):</b>\n"
+            "/set - Show all editable settings\n"
+            "/set size 1000 - Order size\n"
+            "/set tp 2.5 - Target PnL %\n"
+            "/set sl 1.5 - Max loss %\n"
+            "/set lev 10 - Leverage\n"
+            "/set maxpos 5 - Max positions\n"
+            "/config - Full config view\n"
+            "/risk - TP/SL & leverage details\n\n"
+            "<b>Logs:</b>\n"
+            "/logs on - Stream all logs\n"
+            "/logs off - Key events only\n\n"
+            "<b>History:</b>\n"
+            "/journal - Recent trades\n"
+            "/learn - Strategy insights\n\n"
             "/help - This message",
             parse_mode=ParseMode.HTML,
         )
@@ -673,6 +747,189 @@ class TelegramBot:
         except ValueError:
             await update.message.reply_text("Invalid number. Usage: /setlev 3")
 
+    async def _cmd_pause(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not self._is_authorized(update):
+            return
+        if not self.trader:
+            await update.message.reply_text("Bot not initialized yet.")
+            return
+        self.trader.paused = True
+        n_pos = len(self.trader.positions)
+        n_pend = len(self.trader.pending_orders)
+        await update.message.reply_text(
+            f"<b>Bot PAUSED</b>\n\n"
+            f"No new orders will be placed.\n"
+            f"Existing positions ({n_pos}) and pending orders ({n_pend}) "
+            f"are still managed (TP/SL active).\n\n"
+            f"/resume to continue trading.",
+            parse_mode=ParseMode.HTML,
+        )
+
+    async def _cmd_resume(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not self._is_authorized(update):
+            return
+        if not self.trader:
+            await update.message.reply_text("Bot not initialized yet.")
+            return
+        self.trader.paused = False
+        await update.message.reply_text(
+            "<b>Bot RESUMED</b>\nScanning for new opportunities.",
+            parse_mode=ParseMode.HTML,
+        )
+
+    async def _cmd_stop(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not self._is_authorized(update):
+            return
+        if not self.trader:
+            await update.message.reply_text("Bot not initialized yet.")
+            return
+        n_pos = len(self.trader.positions)
+        n_pend = len(self.trader.pending_orders)
+        if n_pos > 0 or n_pend > 0:
+            await update.message.reply_text(
+                f"<b>WARNING:</b> {n_pos} positions and {n_pend} pending orders still open.\n"
+                f"Use /closeall first, or /stop force to stop anyway.",
+                parse_mode=ParseMode.HTML,
+            )
+            if not (context.args and context.args[0].lower() == "force"):
+                return
+        self.trader.running = False
+        await update.message.reply_text(
+            "<b>Bot STOPPING...</b>\nRestart: <code>sudo systemctl restart auto-trading-bot</code>",
+            parse_mode=ParseMode.HTML,
+        )
+
+    async def _cmd_closeall(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not self._is_authorized(update):
+            return
+        if not self.trader:
+            await update.message.reply_text("Bot not initialized yet.")
+            return
+
+        self.trader.paused = True
+        closed = 0
+        cancelled = 0
+
+        for sym in list(self.trader.pending_orders.keys()):
+            self.trader._cancel_pending_order(sym)
+            cancelled += 1
+
+        for sym in list(self.trader.positions.keys()):
+            self.trader.exchange.switch_symbol(sym)
+            try:
+                price = self.trader.exchange.get_ticker_price()
+                self.trader._close_position(sym, price, "manual_close")
+                closed += 1
+            except Exception as e:
+                await update.message.reply_text(f"Failed to close {sym}: {e}")
+
+        self.trader.exchange.switch_symbol(self.trader.config.hl_symbol)
+        await update.message.reply_text(
+            f"<b>All positions closed</b>\n"
+            f"Closed: {closed} | Cancelled: {cancelled}\n"
+            f"Bot is PAUSED. /resume to continue.",
+            parse_mode=ParseMode.HTML,
+        )
+
+    async def _cmd_set(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not self._is_authorized(update):
+            return
+        if not self.trader:
+            await update.message.reply_text("Bot not initialized yet.")
+            return
+
+        if not context.args or len(context.args) < 2:
+            c = self.trader.config
+            await update.message.reply_text(
+                f"<b>Live Config (editable)</b>\n\n"
+                f"<code>size    </code> {c.order_size}\n"
+                f"<code>tp      </code> {c.target_pnl_pct}%\n"
+                f"<code>sl      </code> {c.max_loss_pct}%\n"
+                f"<code>lev     </code> {c.hl_leverage}x\n"
+                f"<code>maxpos  </code> {c.hl_max_positions}\n"
+                f"<code>interval</code> {c.check_interval}s\n"
+                f"<code>ttl     </code> {c.order_ttl_hours}h\n"
+                f"<code>cooldown</code> {c.cooldown_seconds}s\n\n"
+                f"Usage: /set size 1000\n"
+                f"       /set tp 2.5\n"
+                f"       /set sl 1.5",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        key = context.args[0].lower()
+        try:
+            val = float(context.args[1])
+        except ValueError:
+            await update.message.reply_text("Invalid number.")
+            return
+
+        c = self.trader.config
+        settings = {
+            "size": ("order_size", 10, 50000, "Order size"),
+            "tp": ("target_pnl_pct", 0.1, 50, "Target PnL %"),
+            "sl": ("max_loss_pct", 0.1, 50, "Max loss %"),
+            "lev": ("hl_leverage", 1, c.hl_max_leverage, "Leverage"),
+            "maxpos": ("hl_max_positions", 1, 20, "Max positions"),
+            "interval": ("check_interval", 1, 300, "Check interval (s)"),
+            "ttl": ("order_ttl_hours", 0.1, 72, "Order TTL (h)"),
+            "cooldown": ("cooldown_seconds", 0, 600, "Cooldown (s)"),
+        }
+
+        if key not in settings:
+            await update.message.reply_text(f"Unknown setting: {key}\nAvailable: {', '.join(settings.keys())}")
+            return
+
+        attr, min_v, max_v, label = settings[key]
+        if val < min_v or val > max_v:
+            await update.message.reply_text(f"{label} must be between {min_v} and {max_v}.")
+            return
+
+        if key in ("lev", "maxpos", "interval", "cooldown"):
+            val = int(val)
+
+        setattr(c, attr, val)
+
+        if key == "lev" and hasattr(self.trader.exchange, '_set_leverage'):
+            self.trader.exchange.config.hl_leverage = int(val)
+            try:
+                self.trader.exchange._set_leverage()
+            except Exception as e:
+                logger.error(f"Leverage update on exchange failed: {e}")
+
+        if key == "maxpos":
+            self.trader.max_positions = int(val)
+
+        await update.message.reply_text(
+            f"<b>{label}</b> set to <code>{val}</code>",
+            parse_mode=ParseMode.HTML,
+        )
+
+    async def _cmd_logs(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not self._is_authorized(update):
+            return
+        handler = self._log_handler
+        if not handler:
+            await update.message.reply_text("Log handler not active.")
+            return
+
+        if context.args and context.args[0].lower() in ("on", "all", "verbose"):
+            handler.verbose = True
+            await update.message.reply_text("Verbose logs: ON\nAll log messages will be forwarded.")
+        elif context.args and context.args[0].lower() in ("off", "quiet", "key"):
+            handler.verbose = False
+            await update.message.reply_text("Verbose logs: OFF\nOnly key events and warnings forwarded.")
+        else:
+            status = "ON (all)" if handler.verbose else "OFF (key events only)"
+            await update.message.reply_text(
+                f"<b>Log Streaming</b>\n\n"
+                f"Verbose: <code>{status}</code>\n\n"
+                f"Usage:\n"
+                f"/logs on — stream all logs\n"
+                f"/logs off — key events only",
+                parse_mode=ParseMode.HTML,
+            )
+
     def start_command_listener(self):
         thread = threading.Thread(target=self._run_polling, daemon=True)
         thread.start()
@@ -699,6 +956,12 @@ class TelegramBot:
         app.add_handler(CommandHandler("learn", self._cmd_learn))
         app.add_handler(CommandHandler("journal", self._cmd_journal))
         app.add_handler(CommandHandler("scan", self._cmd_scan))
+        app.add_handler(CommandHandler("pause", self._cmd_pause))
+        app.add_handler(CommandHandler("resume", self._cmd_resume))
+        app.add_handler(CommandHandler("stop", self._cmd_stop))
+        app.add_handler(CommandHandler("closeall", self._cmd_closeall))
+        app.add_handler(CommandHandler("set", self._cmd_set))
+        app.add_handler(CommandHandler("logs", self._cmd_logs))
 
         await app.initialize()
         await app.start()
