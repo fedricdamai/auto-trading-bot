@@ -59,7 +59,7 @@ def main():
 
     tg_bot = None
     if config.telegram_enabled:
-        tg_bot = TelegramBot(config.tg_bot_token, config.tg_chat_id)
+        tg_bot = TelegramBot(config.tg_bot_token, config.tg_chat_id, config.telegram_whitelist)
         logger.info("Telegram bot enabled")
 
     trader = Trader(config, exchange, tg_bot)

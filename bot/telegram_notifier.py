@@ -11,16 +11,24 @@ logger = logging.getLogger(__name__)
 class TelegramBot:
     """Telegram bot with commands and notifications."""
 
-    def __init__(self, token: str, chat_id: str):
+    def __init__(self, token: str, chat_id: str, allowed_users: set[int] | None = None):
         self.token = token
         self.chat_id = chat_id
         self.bot = Bot(token=token)
         self.trader = None  # set after trader is created
+        self.allowed_users = allowed_users or set()
         self._app = None
         self._loop = None
 
     def set_trader(self, trader):
         self.trader = trader
+
+    def _is_authorized(self, update: Update) -> bool:
+        """Check if the user is in the whitelist."""
+        user_id = update.effective_user.id
+        if not self.allowed_users:
+            return True
+        return user_id in self.allowed_users
 
     # ── Sending messages ──
 
@@ -93,6 +101,9 @@ class TelegramBot:
     # ── Command handlers ──
 
     async def _cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not self._is_authorized(update):
+            logger.warning(f"Unauthorized access attempt from user {update.effective_user.id}")
+            return
         await update.message.reply_text(
             "<b>Auto Trading Bot</b>\n\n"
             "Commands:\n"
@@ -106,9 +117,13 @@ class TelegramBot:
         )
 
     async def _cmd_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not self._is_authorized(update):
+            return
         await self._cmd_start(update, context)
 
     async def _cmd_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not self._is_authorized(update):
+            return
         if not self.trader:
             await update.message.reply_text("Bot not initialized yet.")
             return
@@ -134,6 +149,8 @@ class TelegramBot:
         )
 
     async def _cmd_levels(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not self._is_authorized(update):
+            return
         if not self.trader or not self.trader.known_levels:
             await update.message.reply_text("No levels detected yet. Wait for the next cycle.")
             return
@@ -164,6 +181,8 @@ class TelegramBot:
         await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
     async def _cmd_orders(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not self._is_authorized(update):
+            return
         if not self.trader or not self.trader.pending_orders:
             await update.message.reply_text("No pending orders.")
             return
@@ -180,6 +199,8 @@ class TelegramBot:
         await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
     async def _cmd_pnl(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not self._is_authorized(update):
+            return
         if not self.trader or not self.trader.open_positions:
             await update.message.reply_text("No open positions.")
             return
@@ -208,6 +229,8 @@ class TelegramBot:
         await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
     async def _cmd_config(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not self._is_authorized(update):
+            return
         if not self.trader:
             await update.message.reply_text("Bot not initialized yet.")
             return

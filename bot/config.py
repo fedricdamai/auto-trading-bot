@@ -42,7 +42,16 @@ class Config:
     # Telegram notifications (optional)
     tg_bot_token: str = os.getenv("TG_BOT_TOKEN", "")
     tg_chat_id: str = os.getenv("TG_CHAT_ID", "")
+    tg_allowed_users: str = os.getenv("TG_ALLOWED_USERS", "")
 
     @property
     def telegram_enabled(self) -> bool:
         return bool(self.tg_bot_token and self.tg_chat_id)
+
+    @property
+    def telegram_whitelist(self) -> set[int]:
+        """Set of Telegram user IDs allowed to use commands."""
+        if not self.tg_allowed_users:
+            # If no whitelist set, only allow the chat_id owner
+            return {int(self.tg_chat_id)} if self.tg_chat_id else set()
+        return {int(uid.strip()) for uid in self.tg_allowed_users.split(",") if uid.strip()}
