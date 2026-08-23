@@ -125,9 +125,12 @@ class TelegramBot:
             "/config - Current settings\n\n"
             "<b>Risk management:</b>\n"
             "/risk - Show TP/SL & leverage info\n"
-            "/settp 1.5 - Set target profit % on margin\n"
-            "/setsl 0.5 - Set max loss % on margin\n"
+            "/settp 1.5 - Set target profit %\n"
+            "/setsl 0.5 - Set max loss %\n"
             "/setlev 3 - Set leverage (1-5)\n\n"
+            "<b>Learning:</b>\n"
+            "/learn - What the bot has learned\n"
+            "/journal - Recent trade history\n\n"
             "/help - This message",
             parse_mode=ParseMode.HTML,
         )
@@ -280,6 +283,54 @@ class TelegramBot:
             f"Check interval: <code>{c.check_interval}s</code>",
             parse_mode=ParseMode.HTML,
         )
+
+    # ── Learning & journal commands ──
+
+    async def _cmd_learn(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not self._is_authorized(update):
+            return
+        if not self.trader:
+            await update.message.reply_text("Bot not initialized yet.")
+            return
+
+        text = self.trader.learner.get_insights_text()
+        await update.message.reply_text(
+            f"<b>Strategy Learner</b>\n\n<pre>{text}</pre>",
+            parse_mode=ParseMode.HTML,
+        )
+
+    async def _cmd_journal(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not self._is_authorized(update):
+            return
+        if not self.trader:
+            await update.message.reply_text("Bot not initialized yet.")
+            return
+
+        trades = self.trader.journal.load_recent(10)
+        if not trades:
+            await update.message.reply_text("No trades recorded yet.")
+            return
+
+        lines = [f"<b>Last {len(trades)} Trades</b>\n"]
+        for i, t in enumerate(reversed(trades), 1):
+            sign = "+" if t.margin_pnl_pct >= 0 else ""
+            icon = "W" if t.margin_pnl_pct > 0 else "L"
+            tfs = ",".join(t.timeframes) if t.timeframes else "—"
+            lines.append(
+                f"{i}. [{icon}] {t.kind} @ <code>{t.entry_price:.2f}</code>\n"
+                f"   Exit: <code>{t.exit_price:.2f}</code> ({t.exit_reason})\n"
+                f"   Margin: <code>{sign}{t.margin_pnl_pct:.2f}%</code> (${sign}{t.pnl_usd:.2f})\n"
+                f"   Str: {t.level_strength} | TF: [{tfs}] | {t.hold_duration_h:.1f}h"
+            )
+
+        stats = self.trader.journal.stats()
+        sign = "+" if stats["total_pnl_usd"] >= 0 else ""
+        lines.append(
+            f"\n<b>Overall: {stats['win_rate']:.0f}% win rate | "
+            f"${sign}{stats['total_pnl_usd']:.2f}</b>"
+        )
+
+        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
     # ── Risk management commands ──
 
@@ -446,6 +497,8 @@ class TelegramBot:
         app.add_handler(CommandHandler("settp", self._cmd_settp))
         app.add_handler(CommandHandler("setsl", self._cmd_setsl))
         app.add_handler(CommandHandler("setlev", self._cmd_setlev))
+        app.add_handler(CommandHandler("learn", self._cmd_learn))
+        app.add_handler(CommandHandler("journal", self._cmd_journal))
 
         await app.initialize()
         await app.start()

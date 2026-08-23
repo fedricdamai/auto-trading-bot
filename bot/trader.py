@@ -5,6 +5,8 @@ from dataclasses import dataclass, field
 from bot.config import Config
 from bot.levels import detect_levels, detect_levels_multi_tf, get_limit_order_prices, compute_tp_sl, Level
 from bot.telegram_notifier import TelegramNotifier
+from bot.trade_journal import TradeJournal, TradeRecord
+from bot.strategy_learner import StrategyLearner
 
 logger = logging.getLogger(__name__)
 
@@ -20,6 +22,7 @@ class PendingOrder:
     stop_loss: float
     take_profit: float
     placed_at: float   # timestamp
+    timeframes: list[str] | None = None
 
 
 @dataclass
@@ -34,6 +37,9 @@ class OpenPosition:
     initial_sl: float = 0.0
     initial_tp: float = 0.0
     highest_price: float = 0.0
+    strength: float = 0.0
+    timeframes: list[str] | None = None
+    filled_at: float = 0.0
 
 
 class Trader:
@@ -48,6 +54,10 @@ class Trader:
         self.known_levels: dict[float, Level] = {}
         self.max_pending = int(config.max_open_orders)
         self.order_ttl = config.order_ttl_hours * 3600
+
+        self.journal = TradeJournal()
+        self.learner = StrategyLearner(self.journal)
+        self._apply_learned_params()
 
     def run_once(self) -> dict:
         """Single cycle: detect levels → manage orders → check positions."""
@@ -125,6 +135,7 @@ class Trader:
             max_orders=available_slots,
         )
 
+        lp = self.learner.params
         for target in targets:
             if target["price"] in existing_prices:
                 continue
@@ -132,12 +143,27 @@ class Trader:
             if target["kind"] == "support" and target["price"] >= current_price:
                 continue
 
+            # Learner filters: minimum strength and timeframe requirements
+            if target["strength"] < lp.min_strength:
+                continue
+            tfs = target.get("timeframes") or []
+            if len(tfs) < lp.min_timeframes:
+                continue
+
+            # Learner weight filter: skip low-weight setups
+            weight = lp.support_weight if target["kind"] == "support" else lp.resistance_weight
+            if weight < 0.4:
+                continue
+
             entry = target["price"]
             sl = target["sl_price"]
             tp = target["tp_price"]
 
+            # Scale order size by learner confidence
+            order_size = self.config.order_size * lp.confidence_scale
+
             try:
-                order = self.exchange.place_limit_buy(entry, self.config.order_size)
+                order = self.exchange.place_limit_buy(entry, order_size)
 
                 pending = PendingOrder(
                     level_price=target["price"],
@@ -148,6 +174,7 @@ class Trader:
                     stop_loss=sl,
                     take_profit=tp,
                     placed_at=time.time(),
+                    timeframes=tfs,
                 )
                 self.pending_orders.append(pending)
                 existing_prices.add(target["price"])
@@ -221,7 +248,8 @@ class Trader:
                     filled = True
 
             if filled:
-                qty = self.config.order_size / pending.entry_price
+                order_size = self.config.order_size * self.learner.params.confidence_scale
+                qty = order_size / pending.entry_price
                 position = OpenPosition(
                     entry_price=pending.entry_price,
                     quantity=qty,
@@ -232,6 +260,9 @@ class Trader:
                     initial_sl=pending.stop_loss,
                     initial_tp=pending.take_profit,
                     highest_price=pending.entry_price,
+                    strength=pending.strength,
+                    timeframes=pending.timeframes or [],
+                    filled_at=time.time(),
                 )
                 self.open_positions.append(position)
                 logger.info(
@@ -246,15 +277,16 @@ class Trader:
     def _manage_positions(self, current_price: float):
         """Check SL/TP on open positions with smart trailing based on S/R levels."""
         remaining = []
+        leverage = self.config.hl_leverage
+        closed_any = False
+
         for pos in self.open_positions:
-            # Track highest price for trailing logic
             if current_price > pos.highest_price:
                 pos.highest_price = current_price
 
-            # Adapt TP/SL using live S/R levels
             self._adapt_tp_sl(pos, current_price)
 
-            margin_pnl = (current_price - pos.entry_price) / pos.entry_price * 100 * self.config.hl_leverage
+            margin_pnl = (current_price - pos.entry_price) / pos.entry_price * 100 * leverage
 
             if current_price <= pos.stop_loss:
                 price_pnl = (current_price - pos.entry_price) / pos.entry_price * 100
@@ -264,6 +296,8 @@ class Trader:
                 )
                 if self.notifier:
                     self.notifier.notify_exit("stop_loss", pos.level_price, pos.kind, current_price, pos.entry_price, leverage)
+                self._record_trade(pos, current_price, "stop_loss")
+                closed_any = True
             elif current_price >= pos.take_profit:
                 price_pnl = (current_price - pos.entry_price) / pos.entry_price * 100
                 logger.info(
@@ -272,10 +306,56 @@ class Trader:
                 )
                 if self.notifier:
                     self.notifier.notify_exit("take_profit", pos.level_price, pos.kind, current_price, pos.entry_price, leverage)
+                self._record_trade(pos, current_price, "take_profit")
+                closed_any = True
             else:
                 remaining.append(pos)
 
         self.open_positions = remaining
+
+        if closed_any:
+            self.learner.learn()
+            self._apply_learned_params()
+
+    def _record_trade(self, pos: OpenPosition, exit_price: float, reason: str):
+        """Record a closed trade to the journal."""
+        leverage = self.config.hl_leverage
+        price_pnl = (exit_price - pos.entry_price) / pos.entry_price * 100
+        margin_pnl = price_pnl * leverage
+        pnl_usd = pos.quantity * (exit_price - pos.entry_price) * leverage
+        hold_h = (time.time() - pos.filled_at) / 3600 if pos.filled_at else 0
+
+        record = TradeRecord(
+            entry_price=pos.entry_price,
+            exit_price=exit_price,
+            entry_time=pos.filled_at,
+            exit_time=time.time(),
+            kind=pos.kind,
+            exit_reason=reason,
+            level_strength=pos.strength,
+            timeframes=pos.timeframes or [],
+            leverage=leverage,
+            price_pnl_pct=round(price_pnl, 4),
+            margin_pnl_pct=round(margin_pnl, 4),
+            quantity=pos.quantity,
+            pnl_usd=round(pnl_usd, 4),
+            sl_trailed=pos.stop_loss != pos.initial_sl,
+            tp_extended=pos.take_profit != pos.initial_tp,
+            hold_duration_h=round(hold_h, 2),
+        )
+        self.journal.record(record)
+
+    def _apply_learned_params(self):
+        """Apply learner's adjustments to config."""
+        lp = self.learner.params
+        if self.journal.stats()["total"] >= 5:
+            self.config.target_pnl_pct = lp.target_pnl_pct
+            self.config.max_loss_pct = lp.max_loss_pct
+            logger.info(
+                f"Learned params applied: min_str={lp.min_strength} min_tf={lp.min_timeframes} "
+                f"sup={lp.support_weight:.1f}x res={lp.resistance_weight:.1f}x "
+                f"size={lp.confidence_scale:.2f}x tp={lp.target_pnl_pct}% sl={lp.max_loss_pct}%"
+            )
 
     def _adapt_tp_sl(self, pos: OpenPosition, current_price: float):
         """Adjust TP/SL based on live S/R levels and price movement.
@@ -299,8 +379,6 @@ class Trader:
         # Rule 1: Trail SL up to nearest support (never lower it)
         if supports_below:
             nearest_support = supports_below[-1].price
-            # Only move SL up if the support is above current SL and below entry
-            # (or above entry if we're trailing in profit)
             if nearest_support > pos.stop_loss:
                 old_sl = pos.stop_loss
                 pos.stop_loss = round(nearest_support * 0.998, 2)  # just below support
