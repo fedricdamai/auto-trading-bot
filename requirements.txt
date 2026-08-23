@@ -1,0 +1,7 @@
+ccxt>=4.0.0
+pandas>=2.0.0
+numpy>=1.24.0
+python-dotenv>=1.0.0
+hyperliquid-python-sdk>=0.4.0
+python-telegram-bot>=21.0
+eth-account>=0.11.0
