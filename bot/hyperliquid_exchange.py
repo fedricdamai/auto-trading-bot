@@ -44,12 +44,13 @@ class HyperliquidExchange:
         except Exception as e:
             logger.error(f"Failed to set leverage: {e}")
 
-    def fetch_ohlcv(self) -> pd.DataFrame:
+    def fetch_ohlcv(self, timeframe: str | None = None, lookback: int | None = None) -> pd.DataFrame:
         """Fetch candle data from Hyperliquid."""
-        interval = self.config.timeframe
+        interval = timeframe or self.config.timeframe
+        candles = lookback or self.config.lookback_candles
         now_ms = int(time.time() * 1000)
         interval_ms = self._interval_to_ms(interval)
-        start_ms = now_ms - (self.config.lookback_candles * interval_ms)
+        start_ms = now_ms - (candles * interval_ms)
 
         raw = self.info.candles_snapshot(
             name=self.config.hl_symbol,

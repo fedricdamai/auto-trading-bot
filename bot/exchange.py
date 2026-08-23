@@ -19,12 +19,12 @@ class Exchange:
             "enableRateLimit": True,
         })
 
-    def fetch_ohlcv(self) -> pd.DataFrame:
+    def fetch_ohlcv(self, timeframe: str | None = None, lookback: int | None = None) -> pd.DataFrame:
         """Fetch OHLCV candles and return as a DataFrame."""
         raw = self.client.fetch_ohlcv(
             self.config.symbol,
-            timeframe=self.config.timeframe,
-            limit=self.config.lookback_candles,
+            timeframe=timeframe or self.config.timeframe,
+            limit=lookback or self.config.lookback_candles,
         )
         df = pd.DataFrame(raw, columns=["timestamp", "open", "high", "low", "close", "volume"])
         df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")

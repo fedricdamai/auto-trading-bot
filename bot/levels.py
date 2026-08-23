@@ -11,10 +11,21 @@ class Level:
     strength: float    # 0-100 composite score
     volume_avg: float  # average volume at touches
     last_touch_idx: int  # recency — how many candles ago
+    timeframes: list[str] | None = None  # which timeframes confirmed this level
+
+
+# Timeframe weights — higher timeframe = more significant level
+TF_WEIGHTS = {"1d": 1.5, "4h": 1.0, "1h": 0.6}
+
+MULTI_TF_CONFIGS = [
+    {"timeframe": "1d", "lookback": 120},
+    {"timeframe": "4h", "lookback": 200},
+    {"timeframe": "1h", "lookback": 200},
+]
 
 
 def detect_levels(df: pd.DataFrame, tolerance_pct: float, min_touches: int) -> list[Level]:
-    """Detect and score support/resistance levels from 4H OHLCV data.
+    """Detect and score support/resistance levels from OHLCV data (single timeframe).
 
     Scoring combines:
       - Touch count (more reactions = stronger)
@@ -22,6 +33,47 @@ def detect_levels(df: pd.DataFrame, tolerance_pct: float, min_touches: int) -> l
       - Recency (recent levels matter more)
       - Rejection strength (how far price bounced from the level)
     """
+    return _detect_from_df(df, tolerance_pct, min_touches, tf_label=None)
+
+
+def detect_levels_multi_tf(
+    exchange,
+    tolerance_pct: float,
+    min_touches: int,
+) -> list[Level]:
+    """Detect S/R levels across 1D, 4H, and 1H timeframes.
+
+    Levels confirmed on multiple timeframes get a strength bonus.
+    Higher timeframe levels are weighted more heavily.
+    """
+    all_raw_levels: list[tuple[Level, str]] = []
+
+    for cfg in MULTI_TF_CONFIGS:
+        tf = cfg["timeframe"]
+        try:
+            df = exchange.fetch_ohlcv(timeframe=tf, lookback=cfg["lookback"])
+            levels = _detect_from_df(df, tolerance_pct, min_touches, tf_label=tf)
+            for lv in levels:
+                all_raw_levels.append((lv, tf))
+        except Exception:
+            continue
+
+    if not all_raw_levels:
+        return []
+
+    current_price = all_raw_levels[0][0].price  # placeholder, recalculated below
+    for lv, _ in all_raw_levels:
+        if lv.last_touch_idx >= 0:
+            current_price = lv.price  # just need any reference
+            break
+
+    return _merge_multi_tf_levels(all_raw_levels, tolerance_pct)
+
+
+def _detect_from_df(
+    df: pd.DataFrame, tolerance_pct: float, min_touches: int, tf_label: str | None,
+) -> list[Level]:
+    """Core detection from a single DataFrame."""
     highs = df["high"].values
     lows = df["low"].values
     closes = df["close"].values
@@ -31,7 +83,6 @@ def detect_levels(df: pd.DataFrame, tolerance_pct: float, min_touches: int) -> l
     n = len(closes)
 
     swing_points = _find_swing_points(highs, lows, closes, window=5)
-
     clusters = _cluster_levels(swing_points, tolerance)
 
     levels = []
@@ -45,13 +96,14 @@ def detect_levels(df: pd.DataFrame, tolerance_pct: float, min_touches: int) -> l
         recency = max(0, 1 - (n - 1 - last_touch) / n) if last_touch >= 0 else 0
 
         strength = (
-            min(touches / 6, 1.0) * 30          # touch count (max 30 pts)
-            + recency * 25                       # recency (max 25 pts)
-            + min(rejection_score / 3, 1.0) * 25 # bounce strength (max 25 pts)
-            + _volume_score(vol_at_touches, volumes) * 20  # volume (max 20 pts)
+            min(touches / 6, 1.0) * 30
+            + recency * 25
+            + min(rejection_score / 3, 1.0) * 25
+            + _volume_score(vol_at_touches, volumes) * 20
         )
 
         kind = "support" if cluster_price < current_price else "resistance"
+        tfs = [tf_label] if tf_label else None
 
         levels.append(Level(
             price=round(cluster_price, 2),
@@ -60,10 +112,72 @@ def detect_levels(df: pd.DataFrame, tolerance_pct: float, min_touches: int) -> l
             strength=round(strength, 1),
             volume_avg=round(vol_at_touches, 2),
             last_touch_idx=last_touch,
+            timeframes=tfs,
         ))
 
     levels.sort(key=lambda l: l.strength, reverse=True)
     return levels
+
+
+def _merge_multi_tf_levels(
+    raw: list[tuple[Level, str]], tolerance_pct: float,
+) -> list[Level]:
+    """Merge levels from different timeframes. Confluence boosts strength."""
+    tolerance = tolerance_pct / 100.0
+    merged: list[dict] = []
+
+    for level, tf in raw:
+        matched = False
+        for group in merged:
+            ref = group["price"]
+            if abs(level.price - ref) / ref <= tolerance:
+                group["levels"].append(level)
+                group["tfs"].add(tf)
+                group["price"] = np.mean([l.price for l in group["levels"]])
+                matched = True
+                break
+
+        if not matched:
+            merged.append({
+                "price": level.price,
+                "levels": [level],
+                "tfs": {tf},
+            })
+
+    result = []
+    for group in merged:
+        lvs = group["levels"]
+        tfs = group["tfs"]
+        price = round(group["price"], 2)
+
+        base_strength = max(l.strength for l in lvs)
+        best = max(lvs, key=lambda l: l.strength)
+
+        # Timeframe weight bonus: higher TFs boost the score
+        tf_bonus = sum(TF_WEIGHTS.get(t, 1.0) for t in tfs)
+
+        # Multi-TF confluence bonus: confirmed on 2 TFs = +15, all 3 = +25
+        confluence_bonus = 0
+        if len(tfs) >= 3:
+            confluence_bonus = 25
+        elif len(tfs) >= 2:
+            confluence_bonus = 15
+
+        total_touches = sum(l.touches for l in lvs)
+        strength = min(base_strength * (tf_bonus / len(tfs)) + confluence_bonus, 100)
+
+        result.append(Level(
+            price=price,
+            kind=best.kind,
+            touches=total_touches,
+            strength=round(strength, 1),
+            volume_avg=round(max(l.volume_avg for l in lvs), 2),
+            last_touch_idx=best.last_touch_idx,
+            timeframes=sorted(tfs),
+        ))
+
+    result.sort(key=lambda l: l.strength, reverse=True)
+    return result
 
 
 def _find_swing_points(
@@ -80,7 +194,6 @@ def _find_swing_points(
             if lows[i] == min(lows[i - w : i + w + 1]):
                 points.append(lows[i])
 
-    # Also add prominent wicks — candles where the wick is large vs the body
     for i in range(n):
         body = abs(closes[i] - closes[max(0, i - 1)])
         upper_wick = highs[i] - max(closes[i], closes[max(0, i - 1)])
@@ -138,7 +251,6 @@ def _analyze_level(
             total_vol += volumes[i]
             last_touch = i
 
-            # Measure rejection: how far did the next candle move away?
             if i + 1 < len(closes):
                 move = abs(closes[i + 1] - level) / level * 100
                 rejection_sum += move
@@ -173,21 +285,25 @@ def get_limit_order_prices(levels: list[Level], current_price: float, max_orders
         if len(orders) >= max_orders:
             break
 
-        # Skip levels too close to an already-selected one
         too_close = any(abs(level.price - p) / current_price < 0.005 for p in used_prices)
         if too_close:
             continue
 
+        multi_tf = level.timeframes and len(level.timeframes) >= 2
+
         if level.kind == "support":
-            # Buy at support: place limit at the level price (waiting for price to drop to it)
             entry = level.price
-            # Tighter SL for strong levels, wider for weak
-            sl_pct = 1.5 if level.strength > 60 else 2.5
-            tp_pct = sl_pct * 2  # 2:1 reward-to-risk minimum
+            if multi_tf:
+                sl_pct = 1.2 if level.strength > 60 else 2.0
+            else:
+                sl_pct = 1.5 if level.strength > 60 else 2.5
+            tp_pct = sl_pct * 2
         else:
-            # Buy at resistance breakout: place limit just above resistance
             entry = round(level.price * 1.002, 2)
-            sl_pct = 2.0 if level.strength > 60 else 3.0
+            if multi_tf:
+                sl_pct = 1.5 if level.strength > 60 else 2.5
+            else:
+                sl_pct = 2.0 if level.strength > 60 else 3.0
             tp_pct = sl_pct * 2
 
         distance_pct = abs(current_price - entry) / current_price * 100
@@ -201,6 +317,7 @@ def get_limit_order_prices(levels: list[Level], current_price: float, max_orders
             "touches": level.touches,
             "sl_pct": sl_pct,
             "tp_pct": tp_pct,
+            "timeframes": level.timeframes,
         })
         used_prices.add(level.price)
 

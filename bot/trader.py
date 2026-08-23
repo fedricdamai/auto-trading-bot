@@ -3,7 +3,7 @@ import time
 from dataclasses import dataclass, field
 
 from bot.config import Config
-from bot.levels import detect_levels, get_limit_order_prices, Level
+from bot.levels import detect_levels, detect_levels_multi_tf, get_limit_order_prices, Level
 from bot.telegram_notifier import TelegramNotifier
 
 logger = logging.getLogger(__name__)
@@ -48,15 +48,23 @@ class Trader:
 
     def run_once(self) -> dict:
         """Single cycle: detect levels → manage orders → check positions."""
-        df = self.exchange.fetch_ohlcv()
         current_price = self.exchange.get_ticker_price()
 
-        # 1. Detect and score levels
-        levels = detect_levels(
-            df,
-            tolerance_pct=self.config.level_tolerance_pct,
-            min_touches=self.config.min_touches,
-        )
+        # 1. Detect and score levels across 1D, 4H, 1H
+        try:
+            levels = detect_levels_multi_tf(
+                self.exchange,
+                tolerance_pct=self.config.level_tolerance_pct,
+                min_touches=self.config.min_touches,
+            )
+        except Exception as e:
+            logger.warning(f"Multi-TF detection failed, falling back to single TF: {e}")
+            df = self.exchange.fetch_ohlcv()
+            levels = detect_levels(
+                df,
+                tolerance_pct=self.config.level_tolerance_pct,
+                min_touches=self.config.min_touches,
+            )
         self.known_levels = {l.price: l for l in levels}
 
         support = [l for l in levels if l.kind == "support"]
@@ -67,7 +75,8 @@ class Trader:
             f"Levels found: {len(support)} support, {len(resistance)} resistance"
         )
         for l in levels[:8]:
-            logger.info(f"  {l.kind.upper():>10} {l.price:.2f} | strength={l.strength} touches={l.touches}")
+            tfs = ",".join(l.timeframes) if l.timeframes else "—"
+            logger.info(f"  {l.kind.upper():>10} {l.price:.2f} | strength={l.strength} touches={l.touches} tf=[{tfs}]")
 
         if self.notifier:
             self.notifier.notify_levels(

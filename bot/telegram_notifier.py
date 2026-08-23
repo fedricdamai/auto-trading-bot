@@ -164,19 +164,21 @@ class TelegramBot:
         support = [l for l in sorted_levels if l.kind == "support"]
         resistance = [l for l in sorted_levels if l.kind == "resistance"]
 
-        lines = [f"<b>S/R Levels</b>\nPrice: <code>{price:.2f}</code>\n"]
+        lines = [f"<b>S/R Levels (Multi-TF)</b>\nPrice: <code>{price:.2f}</code>\n"]
 
         if resistance:
             lines.append("<b>Resistance:</b>")
             for l in resistance[:5]:
                 dist = abs(l.price - price) / price * 100
-                lines.append(f"  <code>{l.price:.2f}</code> | str={l.strength} t={l.touches} ({dist:.1f}% away)")
+                tfs = ",".join(l.timeframes) if l.timeframes else "—"
+                lines.append(f"  <code>{l.price:.2f}</code> | str={l.strength} t={l.touches} [{tfs}] ({dist:.1f}%)")
 
         if support:
             lines.append("\n<b>Support:</b>")
             for l in support[:5]:
                 dist = abs(l.price - price) / price * 100
-                lines.append(f"  <code>{l.price:.2f}</code> | str={l.strength} t={l.touches} ({dist:.1f}% away)")
+                tfs = ",".join(l.timeframes) if l.timeframes else "—"
+                lines.append(f"  <code>{l.price:.2f}</code> | str={l.strength} t={l.touches} [{tfs}] ({dist:.1f}%)")
 
         await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
