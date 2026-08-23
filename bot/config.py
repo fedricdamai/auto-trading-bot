@@ -25,20 +25,25 @@ class Config:
     hl_mainnet: bool = os.getenv("HL_MAINNET", "false").lower() == "true"
 
     # Shared trading settings
-    timeframe: str = os.getenv("TIMEFRAME", "4h")
+    timeframe: str = os.getenv("TIMEFRAME", "5m")
     lookback_candles: int = int(os.getenv("LOOKBACK_CANDLES", "200"))
     min_touches: int = int(os.getenv("MIN_TOUCHES", "2"))
     level_tolerance_pct: float = float(os.getenv("LEVEL_TOLERANCE_PCT", "0.5"))
     order_size: float = float(os.getenv("ORDER_SIZE", "50"))
     target_pnl_pct: float = float(os.getenv("TARGET_PNL_PCT", "1.0"))
     max_loss_pct: float = float(os.getenv("MAX_LOSS_PCT", "1.0"))
-    check_interval: int = int(os.getenv("CHECK_INTERVAL", "300"))
+    check_interval: int = int(os.getenv("CHECK_INTERVAL", "5"))
     paper_trade: bool = os.getenv("PAPER_TRADE", "true").lower() == "true"
     log_level: str = os.getenv("LOG_LEVEL", "INFO")
 
-    # Order management
-    max_open_orders: int = int(os.getenv("MAX_OPEN_ORDERS", "5"))
+    # Scalp trading settings
+    max_open_orders: int = int(os.getenv("MAX_OPEN_ORDERS", "1"))
     order_ttl_hours: float = float(os.getenv("ORDER_TTL_HOURS", "24"))
+    level_refresh_seconds: int = int(os.getenv("LEVEL_REFRESH_SECONDS", "300"))
+    touch_pct: float = float(os.getenv("TOUCH_PCT", "0.1"))
+    approach_pct: float = float(os.getenv("APPROACH_PCT", "0.3"))
+    doji_check_seconds: int = int(os.getenv("DOJI_CHECK_SECONDS", "300"))
+    cooldown_seconds: int = int(os.getenv("COOLDOWN_SECONDS", "60"))
 
     # Telegram notifications (optional)
     tg_bot_token: str = os.getenv("TG_BOT_TOKEN", "")
@@ -51,8 +56,6 @@ class Config:
 
     @property
     def telegram_whitelist(self) -> set[int]:
-        """Set of Telegram user IDs allowed to use commands."""
         if not self.tg_allowed_users:
-            # If no whitelist set, only allow the chat_id owner
             return {int(self.tg_chat_id)} if self.tg_chat_id else set()
         return {int(uid.strip()) for uid in self.tg_allowed_users.split(",") if uid.strip()}

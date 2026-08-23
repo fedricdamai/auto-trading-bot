@@ -16,18 +16,19 @@ class TradeRecord:
     exit_price: float
     entry_time: float
     exit_time: float
+    side: str               # "long" or "short"
     kind: str               # "support" or "resistance"
-    exit_reason: str         # "take_profit" or "stop_loss"
+    exit_reason: str        # "take_profit" or "stop_loss"
     level_strength: float
     timeframes: list[str]
     leverage: int
-    price_pnl_pct: float    # price movement %
-    margin_pnl_pct: float   # PnL on margin (price_pnl × leverage)
+    price_pnl_pct: float
+    margin_pnl_pct: float
     quantity: float
     pnl_usd: float
-    sl_trailed: bool        # was SL adjusted during the trade
-    tp_extended: bool        # was TP extended during the trade
-    hold_duration_h: float   # how long position was open
+    sl_trailed: bool
+    tp_extended: bool
+    hold_duration_h: float
 
 
 class TradeJournal:
@@ -40,7 +41,7 @@ class TradeJournal:
         try:
             with open(self.path, "a") as f:
                 f.write(json.dumps(asdict(trade)) + "\n")
-            logger.info(f"Trade recorded: {trade.exit_reason} {trade.kind} PnL={trade.margin_pnl_pct:+.2f}%")
+            logger.info(f"Trade recorded: {trade.side} {trade.exit_reason} {trade.kind} PnL={trade.margin_pnl_pct:+.2f}%")
         except Exception as e:
             logger.error(f"Failed to write trade journal: {e}")
 
@@ -55,6 +56,8 @@ class TradeJournal:
                     if not line:
                         continue
                     data = json.loads(line)
+                    if "side" not in data:
+                        data["side"] = "long"
                     records.append(TradeRecord(**data))
         except Exception as e:
             logger.error(f"Failed to read trade journal: {e}")
@@ -65,7 +68,6 @@ class TradeJournal:
         return all_trades[-n:]
 
     def stats(self) -> dict:
-        """Compute overall trading statistics."""
         trades = self.load_all()
         if not trades:
             return {"total": 0}
@@ -77,25 +79,26 @@ class TradeJournal:
         avg_win = sum(t.margin_pnl_pct for t in wins) / len(wins) if wins else 0
         avg_loss = sum(t.margin_pnl_pct for t in losses) / len(losses) if losses else 0
 
-        # Stats by kind
         support_trades = [t for t in trades if t.kind == "support"]
         resistance_trades = [t for t in trades if t.kind == "resistance"]
         support_wins = [t for t in support_trades if t.margin_pnl_pct > 0]
         resistance_wins = [t for t in resistance_trades if t.margin_pnl_pct > 0]
 
-        # Stats by timeframe confluence
+        long_trades = [t for t in trades if t.side == "long"]
+        short_trades = [t for t in trades if t.side == "short"]
+        long_wins = [t for t in long_trades if t.margin_pnl_pct > 0]
+        short_wins = [t for t in short_trades if t.margin_pnl_pct > 0]
+
         multi_tf = [t for t in trades if len(t.timeframes) >= 2]
         single_tf = [t for t in trades if len(t.timeframes) < 2]
         multi_tf_wins = [t for t in multi_tf if t.margin_pnl_pct > 0]
         single_tf_wins = [t for t in single_tf if t.margin_pnl_pct > 0]
 
-        # Stats by strength range
         strong = [t for t in trades if t.level_strength >= 60]
         weak = [t for t in trades if t.level_strength < 60]
         strong_wins = [t for t in strong if t.margin_pnl_pct > 0]
         weak_wins = [t for t in weak if t.margin_pnl_pct > 0]
 
-        # Trailing stats
         trailed = [t for t in trades if t.sl_trailed]
         trailed_wins = [t for t in trailed if t.margin_pnl_pct > 0]
 
@@ -111,6 +114,10 @@ class TradeJournal:
             "support_win_rate": len(support_wins) / len(support_trades) * 100 if support_trades else 0,
             "resistance_total": len(resistance_trades),
             "resistance_win_rate": len(resistance_wins) / len(resistance_trades) * 100 if resistance_trades else 0,
+            "long_total": len(long_trades),
+            "long_win_rate": len(long_wins) / len(long_trades) * 100 if long_trades else 0,
+            "short_total": len(short_trades),
+            "short_win_rate": len(short_wins) / len(short_trades) * 100 if short_trades else 0,
             "multi_tf_total": len(multi_tf),
             "multi_tf_win_rate": len(multi_tf_wins) / len(multi_tf) * 100 if multi_tf else 0,
             "single_tf_total": len(single_tf),

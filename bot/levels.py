@@ -7,32 +7,32 @@ from dataclasses import dataclass
 class Level:
     price: float
     kind: str          # "support" or "resistance"
-    touches: int       # how many times price reacted here
+    touches: int
     strength: float    # 0-100 composite score
-    volume_avg: float  # average volume at touches
-    last_touch_idx: int  # recency — how many candles ago
-    timeframes: list[str] | None = None  # which timeframes confirmed this level
+    volume_avg: float
+    last_touch_idx: int
+    timeframes: list[str] | None = None
 
 
-# Timeframe weights — higher timeframe = more significant level
-TF_WEIGHTS = {"1d": 1.5, "4h": 1.0, "1h": 0.6}
+@dataclass
+class DojiSignal:
+    signal: str        # "bullish", "bearish", or "neutral"
+    strength: float    # 0-100 how significant the doji is
+    price: float       # price where the doji formed
+    candle_range: float  # total range of the doji candle
+
+
+TF_WEIGHTS = {"1d": 1.5, "4h": 1.0, "1h": 0.6, "5m": 0.3}
 
 MULTI_TF_CONFIGS = [
     {"timeframe": "1d", "lookback": 120},
     {"timeframe": "4h", "lookback": 200},
     {"timeframe": "1h", "lookback": 200},
+    {"timeframe": "5m", "lookback": 200},
 ]
 
 
 def detect_levels(df: pd.DataFrame, tolerance_pct: float, min_touches: int) -> list[Level]:
-    """Detect and score support/resistance levels from OHLCV data (single timeframe).
-
-    Scoring combines:
-      - Touch count (more reactions = stronger)
-      - Volume at touches (high volume reactions = institutional interest)
-      - Recency (recent levels matter more)
-      - Rejection strength (how far price bounced from the level)
-    """
     return _detect_from_df(df, tolerance_pct, min_touches, tf_label=None)
 
 
@@ -41,11 +41,6 @@ def detect_levels_multi_tf(
     tolerance_pct: float,
     min_touches: int,
 ) -> list[Level]:
-    """Detect S/R levels across 1D, 4H, and 1H timeframes.
-
-    Levels confirmed on multiple timeframes get a strength bonus.
-    Higher timeframe levels are weighted more heavily.
-    """
     all_raw_levels: list[tuple[Level, str]] = []
 
     for cfg in MULTI_TF_CONFIGS:
@@ -61,19 +56,59 @@ def detect_levels_multi_tf(
     if not all_raw_levels:
         return []
 
-    current_price = all_raw_levels[0][0].price  # placeholder, recalculated below
-    for lv, _ in all_raw_levels:
-        if lv.last_touch_idx >= 0:
-            current_price = lv.price  # just need any reference
-            break
-
     return _merge_multi_tf_levels(all_raw_levels, tolerance_pct)
+
+
+def detect_doji(df: pd.DataFrame, lookback: int = 5) -> DojiSignal | None:
+    if len(df) < lookback + 1:
+        return None
+
+    recent = df.iloc[-(lookback + 1):-1]
+    avg_range = (recent["high"] - recent["low"]).mean()
+    if avg_range == 0:
+        return None
+
+    candle = df.iloc[-2]
+    o, h, l, c = candle["open"], candle["high"], candle["low"], candle["close"]
+    body = abs(c - o)
+    full_range = h - l
+
+    if full_range == 0:
+        return None
+
+    body_ratio = body / full_range
+    range_ratio = full_range / avg_range
+
+    if body_ratio > 0.15:
+        return None
+    if range_ratio < 1.2:
+        return None
+
+    upper_wick = h - max(o, c)
+    lower_wick = min(o, c) - l
+
+    strength = min(100.0, range_ratio * 30 + (1 - body_ratio) * 20)
+
+    if lower_wick > upper_wick * 2.5:
+        signal = "bullish"
+        strength += 15
+    elif upper_wick > lower_wick * 2.5:
+        signal = "bearish"
+        strength += 15
+    else:
+        signal = "neutral"
+
+    return DojiSignal(
+        signal=signal,
+        strength=min(strength, 100),
+        price=round((h + l) / 2, 2),
+        candle_range=round(full_range, 2),
+    )
 
 
 def _detect_from_df(
     df: pd.DataFrame, tolerance_pct: float, min_touches: int, tf_label: str | None,
 ) -> list[Level]:
-    """Core detection from a single DataFrame."""
     highs = df["high"].values
     lows = df["low"].values
     closes = df["close"].values
@@ -122,7 +157,6 @@ def _detect_from_df(
 def _merge_multi_tf_levels(
     raw: list[tuple[Level, str]], tolerance_pct: float,
 ) -> list[Level]:
-    """Merge levels from different timeframes. Confluence boosts strength."""
     tolerance = tolerance_pct / 100.0
     merged: list[dict] = []
 
@@ -153,12 +187,12 @@ def _merge_multi_tf_levels(
         base_strength = max(l.strength for l in lvs)
         best = max(lvs, key=lambda l: l.strength)
 
-        # Timeframe weight bonus: higher TFs boost the score
         tf_bonus = sum(TF_WEIGHTS.get(t, 1.0) for t in tfs)
 
-        # Multi-TF confluence bonus: confirmed on 2 TFs = +15, all 3 = +25
         confluence_bonus = 0
-        if len(tfs) >= 3:
+        if len(tfs) >= 4:
+            confluence_bonus = 30
+        elif len(tfs) >= 3:
             confluence_bonus = 25
         elif len(tfs) >= 2:
             confluence_bonus = 15
@@ -183,7 +217,6 @@ def _merge_multi_tf_levels(
 def _find_swing_points(
     highs: np.ndarray, lows: np.ndarray, closes: np.ndarray, window: int,
 ) -> list[float]:
-    """Identify swing highs and swing lows using multiple window sizes."""
     points = []
     n = len(highs)
 
@@ -208,7 +241,6 @@ def _find_swing_points(
 
 
 def _cluster_levels(prices: list[float], tolerance: float) -> list[float]:
-    """Group nearby price points into single levels using weighted mean."""
     if not prices:
         return []
 
@@ -233,10 +265,6 @@ def _analyze_level(
     volumes: np.ndarray,
     tolerance: float,
 ) -> tuple[int, float, int, float]:
-    """Analyze how price interacts with a level.
-
-    Returns (touch_count, avg_volume_at_touches, last_touch_index, avg_rejection_pct).
-    """
     band_low = level * (1 - tolerance)
     band_high = level * (1 + tolerance)
 
@@ -262,7 +290,6 @@ def _analyze_level(
 
 
 def _volume_score(vol_at_level: float, all_volumes: np.ndarray) -> float:
-    """Score 0-1 based on how the volume at this level compares to average."""
     avg = np.mean(all_volumes)
     if avg == 0:
         return 0
@@ -272,35 +299,31 @@ def _volume_score(vol_at_level: float, all_volumes: np.ndarray) -> float:
 
 def compute_tp_sl(
     entry: float, leverage: int, target_pnl_pct: float, max_loss_pct: float,
+    side: str = "long",
 ) -> dict:
-    """Calculate TP/SL prices for a leveraged long position.
+    tp_move = target_pnl_pct / leverage
+    sl_move = max_loss_pct / leverage
 
-    Args:
-        entry: entry price
-        leverage: position leverage (1-5)
-        target_pnl_pct: desired profit % on margin (e.g. 1.0 = 1%)
-        max_loss_pct: max loss % on margin (e.g. 1.0 = 1%)
+    if side == "long":
+        liq_price = entry * (1 - (1 / leverage) + 0.02)
+        max_sl_move = (1 / leverage) * 0.5 * 100
+        sl_move = min(sl_move, max_sl_move)
 
-    Returns dict with tp_price, sl_price, tp_move_pct, sl_move_pct, liq_price.
-    """
-    # Price move needed: margin_pnl% = price_move% × leverage
-    tp_move = target_pnl_pct / leverage  # price % move for target
-    sl_move = max_loss_pct / leverage    # price % move for stop
+        tp_price = round(entry * (1 + tp_move / 100), 2)
+        sl_price = round(entry * (1 - sl_move / 100), 2)
 
-    # Liquidation price (simplified): entry × (1 - 1/leverage)
-    # Add 2% buffer for fees/funding
-    liq_price = entry * (1 - (1 / leverage) + 0.02)
+        if sl_price <= liq_price:
+            sl_price = round(liq_price * 1.02, 2)
+    else:
+        liq_price = entry * (1 + (1 / leverage) - 0.02)
+        max_sl_move = (1 / leverage) * 0.5 * 100
+        sl_move = min(sl_move, max_sl_move)
 
-    # SL must stay above liquidation with safety margin
-    max_sl_move = (1 / leverage) * 0.5 * 100  # 50% of liquidation distance
-    sl_move = min(sl_move, max_sl_move)
+        tp_price = round(entry * (1 - tp_move / 100), 2)
+        sl_price = round(entry * (1 + sl_move / 100), 2)
 
-    tp_price = round(entry * (1 + tp_move / 100), 2)
-    sl_price = round(entry * (1 - sl_move / 100), 2)
-
-    # Hard floor: SL must be above liquidation
-    if sl_price <= liq_price:
-        sl_price = round(liq_price * 1.02, 2)
+        if sl_price >= liq_price:
+            sl_price = round(liq_price * 0.98, 2)
 
     return {
         "tp_price": tp_price,
@@ -319,11 +342,6 @@ def get_limit_order_prices(
     max_loss_pct: float = 1.0,
     max_orders: int = 5,
 ) -> list[dict]:
-    """Pick the best levels to place limit orders at.
-
-    TP/SL are calculated based on leverage so each trade targets
-    the specified margin PnL % while staying safe from liquidation.
-    """
     orders = []
     used_prices = set()
 
@@ -337,18 +355,21 @@ def get_limit_order_prices(
 
         if level.kind == "support":
             entry = level.price
+            side = "long"
         else:
             entry = round(level.price * 1.002, 2)
+            side = "short"
 
         distance_pct = abs(current_price - entry) / current_price * 100
         if distance_pct > 10:
             continue
 
-        tpsl = compute_tp_sl(entry, leverage, target_pnl_pct, max_loss_pct)
+        tpsl = compute_tp_sl(entry, leverage, target_pnl_pct, max_loss_pct, side=side)
 
         orders.append({
             "price": entry,
             "kind": level.kind,
+            "side": side,
             "strength": level.strength,
             "touches": level.touches,
             "timeframes": level.timeframes,

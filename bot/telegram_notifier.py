@@ -17,7 +17,7 @@ class TelegramBot:
         self.token = token
         self.chat_id = chat_id
         self.bot = Bot(token=token)
-        self.trader = None  # set after trader is created
+        self.trader = None
         self.allowed_users = allowed_users or set()
         self._app = None
         self._loop = None
@@ -26,13 +26,10 @@ class TelegramBot:
         self.trader = trader
 
     def _is_authorized(self, update: Update) -> bool:
-        """Check if the user is in the whitelist."""
         user_id = update.effective_user.id
         if not self.allowed_users:
             return True
         return user_id in self.allowed_users
-
-    # ── Sending messages ──
 
     def send(self, message: str):
         try:
@@ -54,21 +51,19 @@ class TelegramBot:
                 parse_mode=ParseMode.HTML,
             )
 
-    # ── Notification helpers ──
-
     def notify_startup(self, symbol: str, timeframe: str, paper: bool, leverage: int = 1):
         mode = "PAPER" if paper else "LIVE"
         self.send(
-            f"<b>Bot Started [{mode}]</b>\n"
+            f"<b>Scalp Bot Started [{mode}]</b>\n"
             f"Symbol: <code>{symbol}</code>\n"
             f"Timeframe: <code>{timeframe}</code>\n"
-            f"Leverage: <code>{leverage}x</code>\n\n"
+            f"Leverage: <code>{leverage}x</code>\n"
+            f"Mode: Long + Short at S/R levels\n\n"
             f"Commands:\n"
-            f"/status - Bot status & positions\n"
+            f"/status - Bot status & position\n"
             f"/levels - S/R levels (multi-TF)\n"
-            f"/risk - TP/SL & leverage info\n"
-            f"/orders - Pending limit orders\n"
             f"/pnl - Position P&L\n"
+            f"/risk - TP/SL & leverage info\n"
             f"/help - All commands"
         )
 
@@ -78,49 +73,57 @@ class TelegramBot:
         self.send(
             f"<b>Levels Update</b>\n"
             f"Price: <code>{current_price:.2f}</code>\n\n"
-            f"<b>Support:</b>\n<code>{sup}</code>\n\n"
-            f"<b>Resistance:</b>\n<code>{res}</code>"
+            f"<b>Support (long zones):</b>\n<code>{sup}</code>\n\n"
+            f"<b>Resistance (short zones):</b>\n<code>{res}</code>"
         )
 
-    def notify_buy(self, level: float, level_type: str, price: float, quantity: float, sl: float, tp: float):
+    def notify_entry(self, side: str, level: float, level_type: str, price: float,
+                     quantity: float, sl: float, tp: float, leverage: int):
+        label = "LONG" if side == "long" else "SHORT"
         self.send(
-            f"<b>LIMIT BUY at {level_type.upper()}</b>\n"
+            f"<b>{label} ENTRY at {level_type.upper()}</b>\n"
             f"Level: <code>{level:.2f}</code>\n"
             f"Entry: <code>{price:.2f}</code>\n"
             f"Size: <code>{quantity:.6f}</code>\n"
-            f"SL: <code>{sl:.2f}</code> | TP: <code>{tp:.2f}</code>"
+            f"SL: <code>{sl:.2f}</code> | TP: <code>{tp:.2f}</code>\n"
+            f"Leverage: <code>{leverage}x</code>"
         )
 
-    def notify_exit(self, reason: str, level: float, level_type: str, price: float, entry: float = 0, leverage: int = 1):
+    def notify_exit(self, reason: str, level: float, level_type: str, price: float,
+                    entry: float = 0, leverage: int = 1, side: str = "long"):
         label = "STOP LOSS" if reason == "stop_loss" else "TAKE PROFIT"
-        emoji = "🔴" if reason == "stop_loss" else "🟢"
+        emoji = "red" if reason == "stop_loss" else "green"
+        side_label = side.upper()
         msg = (
-            f"<b>{emoji} {label} HIT</b>\n"
+            f"<b>{label} HIT ({side_label})</b>\n"
             f"Level: <code>{level:.2f}</code> ({level_type})\n"
             f"Exit price: <code>{price:.2f}</code>"
         )
         if entry > 0:
-            price_pnl = (price - entry) / entry * 100
+            if side == "long":
+                price_pnl = (price - entry) / entry * 100
+            else:
+                price_pnl = (entry - price) / entry * 100
             margin_pnl = price_pnl * leverage
             sign = "+" if margin_pnl >= 0 else ""
             msg += f"\nMargin PnL: <code>{sign}{margin_pnl:.2f}%</code> ({leverage}x)"
         self.send(msg)
 
+    def notify_buy(self, level: float, level_type: str, price: float, quantity: float, sl: float, tp: float):
+        self.notify_entry("long", level, level_type, price, quantity, sl, tp, 1)
+
     def notify_error(self, error: str):
         self.send(f"<b>Error</b>\n<code>{error[:500]}</code>")
-
-    # ── Command handlers ──
 
     async def _cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not self._is_authorized(update):
             logger.warning(f"Unauthorized access attempt from user {update.effective_user.id}")
             return
         await update.message.reply_text(
-            "<b>Auto Trading Bot</b>\n\n"
+            "<b>Scalp Trading Bot</b>\n\n"
             "<b>Monitor:</b>\n"
-            "/status - Bot status & positions\n"
+            "/status - Bot status & position\n"
             "/levels - Current support & resistance\n"
-            "/orders - Pending limit orders\n"
             "/pnl - Position P&L\n"
             "/config - Current settings\n\n"
             "<b>Risk management:</b>\n"
@@ -152,18 +155,35 @@ class TelegramBot:
         except Exception:
             price = 0
 
-        pending = len(self.trader.pending_orders)
-        positions = len(self.trader.open_positions)
         levels = len(self.trader.known_levels)
-
         mode = "PAPER" if self.trader.config.paper_trade else "LIVE"
+
+        pos = self.trader.position
+        if pos:
+            lev = self.trader.config.hl_leverage
+            if pos.side == "long":
+                price_pnl = (price - pos.entry_price) / pos.entry_price * 100
+            else:
+                price_pnl = (pos.entry_price - price) / pos.entry_price * 100
+            margin_pnl = price_pnl * lev
+            sign = "+" if margin_pnl >= 0 else ""
+
+            pos_text = (
+                f"\n\n<b>Position: {pos.side.upper()}</b>\n"
+                f"Entry: <code>{pos.entry_price:.2f}</code> ({pos.kind})\n"
+                f"Now: <code>{price:.2f}</code>\n"
+                f"Margin PnL: <code>{sign}{margin_pnl:.2f}%</code>\n"
+                f"SL: <code>{pos.stop_loss:.2f}</code> | TP: <code>{pos.take_profit:.2f}</code>"
+            )
+        else:
+            pos_text = "\n\nNo open position — scanning for entry..."
 
         await update.message.reply_text(
             f"<b>Bot Status [{mode}]</b>\n\n"
             f"Price: <code>{price:.2f}</code>\n"
             f"Levels tracked: <code>{levels}</code>\n"
-            f"Pending orders: <code>{pending}</code>\n"
-            f"Open positions: <code>{positions}</code>",
+            f"Tick interval: <code>{self.trader.config.check_interval}s</code>"
+            f"{pos_text}",
             parse_mode=ParseMode.HTML,
         )
 
@@ -171,7 +191,7 @@ class TelegramBot:
         if not self._is_authorized(update):
             return
         if not self.trader or not self.trader.known_levels:
-            await update.message.reply_text("No levels detected yet. Wait for the next cycle.")
+            await update.message.reply_text("No levels detected yet. Wait for the next refresh.")
             return
 
         try:
@@ -186,44 +206,26 @@ class TelegramBot:
         lines = [f"<b>S/R Levels (Multi-TF)</b>\nPrice: <code>{price:.2f}</code>\n"]
 
         if resistance:
-            lines.append("<b>Resistance:</b>")
+            lines.append("<b>Resistance (short zones):</b>")
             for l in resistance[:5]:
                 dist = abs(l.price - price) / price * 100
-                tfs = ",".join(l.timeframes) if l.timeframes else "—"
+                tfs = ",".join(l.timeframes) if l.timeframes else "-"
                 lines.append(f"  <code>{l.price:.2f}</code> | str={l.strength} t={l.touches} [{tfs}] ({dist:.1f}%)")
 
         if support:
-            lines.append("\n<b>Support:</b>")
+            lines.append("\n<b>Support (long zones):</b>")
             for l in support[:5]:
                 dist = abs(l.price - price) / price * 100
-                tfs = ",".join(l.timeframes) if l.timeframes else "—"
+                tfs = ",".join(l.timeframes) if l.timeframes else "-"
                 lines.append(f"  <code>{l.price:.2f}</code> | str={l.strength} t={l.touches} [{tfs}] ({dist:.1f}%)")
-
-        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
-
-    async def _cmd_orders(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not self._is_authorized(update):
-            return
-        if not self.trader or not self.trader.pending_orders:
-            await update.message.reply_text("No pending orders.")
-            return
-
-        lines = ["<b>Pending Limit Orders</b>\n"]
-        for i, o in enumerate(self.trader.pending_orders, 1):
-            age_h = ((__import__("time").time() - o.placed_at) / 3600)
-            lines.append(
-                f"{i}. <code>{o.entry_price:.2f}</code> ({o.kind})\n"
-                f"   SL: <code>{o.stop_loss:.2f}</code> | TP: <code>{o.take_profit:.2f}</code>\n"
-                f"   Strength: {o.strength} | Age: {age_h:.1f}h"
-            )
 
         await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
     async def _cmd_pnl(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not self._is_authorized(update):
             return
-        if not self.trader or not self.trader.open_positions:
-            await update.message.reply_text("No open positions.")
+        if not self.trader or not self.trader.position:
+            await update.message.reply_text("No open position.")
             return
 
         try:
@@ -232,32 +234,36 @@ class TelegramBot:
             await update.message.reply_text("Could not fetch current price.")
             return
 
+        pos = self.trader.position
         lev = self.trader.config.hl_leverage
-        lines = [f"<b>Open Positions ({lev}x)</b>\n"]
-        total_pnl = 0
-        for i, pos in enumerate(self.trader.open_positions, 1):
+
+        if pos.side == "long":
             price_pnl = (price - pos.entry_price) / pos.entry_price * 100
-            margin_pnl = price_pnl * lev
             pnl_usd = pos.quantity * (price - pos.entry_price) * lev
-            total_pnl += pnl_usd
-            sign = "+" if margin_pnl >= 0 else ""
+        else:
+            price_pnl = (pos.entry_price - price) / pos.entry_price * 100
+            pnl_usd = pos.quantity * (pos.entry_price - price) * lev
 
-            sl_moved = pos.stop_loss != pos.initial_sl
-            sl_tag = " (trailed)" if sl_moved else ""
-            tp_moved = pos.take_profit != pos.initial_tp
-            tp_tag = " (extended)" if tp_moved else ""
+        margin_pnl = price_pnl * lev
+        sign = "+" if margin_pnl >= 0 else ""
 
-            lines.append(
-                f"{i}. Entry: <code>{pos.entry_price:.2f}</code> ({pos.kind})\n"
-                f"   Now: <code>{price:.2f}</code>\n"
-                f"   Margin PnL: <code>{sign}{margin_pnl:.2f}%</code> ({sign}{pnl_usd:.2f})\n"
-                f"   SL: <code>{pos.stop_loss:.2f}</code>{sl_tag}\n"
-                f"   TP: <code>{pos.take_profit:.2f}</code>{tp_tag}"
-            )
+        sl_moved = pos.stop_loss != pos.initial_sl
+        sl_tag = " (trailed)" if sl_moved else ""
+        tp_moved = pos.take_profit != pos.initial_tp
+        tp_tag = " (extended)" if tp_moved else ""
 
-        sign = "+" if total_pnl >= 0 else ""
-        lines.append(f"\n<b>Total PnL: <code>{sign}{total_pnl:.2f}</code></b>")
-        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+        hold_h = ((__import__("time").time() - pos.filled_at) / 3600) if pos.filled_at else 0
+
+        await update.message.reply_text(
+            f"<b>{pos.side.upper()} Position ({lev}x)</b>\n\n"
+            f"Entry: <code>{pos.entry_price:.2f}</code> ({pos.kind})\n"
+            f"Now: <code>{price:.2f}</code>\n"
+            f"Margin PnL: <code>{sign}{margin_pnl:.2f}%</code> ({sign}{pnl_usd:.2f})\n"
+            f"SL: <code>{pos.stop_loss:.2f}</code>{sl_tag}\n"
+            f"TP: <code>{pos.take_profit:.2f}</code>{tp_tag}\n"
+            f"Hold time: <code>{hold_h:.1f}h</code>",
+            parse_mode=ParseMode.HTML,
+        )
 
     async def _cmd_config(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not self._is_authorized(update):
@@ -275,16 +281,16 @@ class TelegramBot:
             f"Symbol: <code>{symbol}</code>\n"
             f"Timeframe: <code>{c.timeframe}</code>\n"
             f"Order size: <code>{c.order_size}</code>\n"
-            f"Max orders: <code>{c.max_open_orders}</code>\n"
-            f"Order TTL: <code>{c.order_ttl_hours}h</code>\n"
             f"Leverage: <code>{c.hl_leverage}x</code> (max {c.hl_max_leverage}x)\n"
             f"Target PnL: <code>{c.target_pnl_pct}%</code>/trade\n"
             f"Max Loss: <code>{c.max_loss_pct}%</code>/trade\n"
-            f"Check interval: <code>{c.check_interval}s</code>",
+            f"Tick interval: <code>{c.check_interval}s</code>\n"
+            f"Level refresh: <code>{c.level_refresh_seconds}s</code>\n"
+            f"Touch zone: <code>{c.touch_pct}%</code>\n"
+            f"Approach zone: <code>{c.approach_pct}%</code>\n"
+            f"Cooldown: <code>{c.cooldown_seconds}s</code>",
             parse_mode=ParseMode.HTML,
         )
-
-    # ── Learning & journal commands ──
 
     async def _cmd_learn(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not self._is_authorized(update):
@@ -315,9 +321,9 @@ class TelegramBot:
         for i, t in enumerate(reversed(trades), 1):
             sign = "+" if t.margin_pnl_pct >= 0 else ""
             icon = "W" if t.margin_pnl_pct > 0 else "L"
-            tfs = ",".join(t.timeframes) if t.timeframes else "—"
+            tfs = ",".join(t.timeframes) if t.timeframes else "-"
             lines.append(
-                f"{i}. [{icon}] {t.kind} @ <code>{t.entry_price:.2f}</code>\n"
+                f"{i}. [{icon}] {t.side.upper()} {t.kind} @ <code>{t.entry_price:.2f}</code>\n"
                 f"   Exit: <code>{t.exit_price:.2f}</code> ({t.exit_reason})\n"
                 f"   Margin: <code>{sign}{t.margin_pnl_pct:.2f}%</code> (${sign}{t.pnl_usd:.2f})\n"
                 f"   Str: {t.level_strength} | TF: [{tfs}] | {t.hold_duration_h:.1f}h"
@@ -329,10 +335,13 @@ class TelegramBot:
             f"\n<b>Overall: {stats['win_rate']:.0f}% win rate | "
             f"${sign}{stats['total_pnl_usd']:.2f}</b>"
         )
+        if stats.get("long_total", 0) > 0 or stats.get("short_total", 0) > 0:
+            lines.append(
+                f"Long: {stats.get('long_win_rate', 0):.0f}% ({stats.get('long_total', 0)}) | "
+                f"Short: {stats.get('short_win_rate', 0):.0f}% ({stats.get('short_total', 0)})"
+            )
 
         await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
-
-    # ── Risk management commands ──
 
     async def _cmd_risk(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not self._is_authorized(update):
@@ -357,13 +366,14 @@ class TelegramBot:
         ]
 
         if price > 0:
-            tpsl = compute_tp_sl(price, lev, c.target_pnl_pct, c.max_loss_pct)
-            lines.append(f"\n<b>Example @ <code>{price:.2f}</code>:</b>")
-            lines.append(f"  TP: <code>{tpsl['tp_price']:.2f}</code> (+{tpsl['tp_move_pct']:.3f}% price)")
-            lines.append(f"  SL: <code>{tpsl['sl_price']:.2f}</code> (-{tpsl['sl_move_pct']:.3f}% price)")
-            lines.append(f"  Liquidation: <code>~{tpsl['liq_price']:.2f}</code>")
-            safety = abs(tpsl['sl_price'] - tpsl['liq_price']) / price * 100
-            lines.append(f"  SL→Liq buffer: <code>{safety:.1f}%</code>")
+            tpsl_long = compute_tp_sl(price, lev, c.target_pnl_pct, c.max_loss_pct, side="long")
+            tpsl_short = compute_tp_sl(price, lev, c.target_pnl_pct, c.max_loss_pct, side="short")
+            lines.append(f"\n<b>Long example @ <code>{price:.2f}</code>:</b>")
+            lines.append(f"  TP: <code>{tpsl_long['tp_price']:.2f}</code> | SL: <code>{tpsl_long['sl_price']:.2f}</code>")
+            lines.append(f"  Liq: <code>~{tpsl_long['liq_price']:.2f}</code>")
+            lines.append(f"\n<b>Short example @ <code>{price:.2f}</code>:</b>")
+            lines.append(f"  TP: <code>{tpsl_short['tp_price']:.2f}</code> | SL: <code>{tpsl_short['sl_price']:.2f}</code>")
+            lines.append(f"  Liq: <code>~{tpsl_short['liq_price']:.2f}</code>")
 
         await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
@@ -411,7 +421,7 @@ class TelegramBot:
                 await update.message.reply_text("Max loss must be between 0.1 and 50.")
                 return
             lev = self.trader.config.hl_leverage
-            max_safe = (1 / lev) * 50  # 50% of liquidation distance
+            max_safe = (1 / lev) * 50
             price_move = val / lev
             if price_move > max_safe:
                 await update.message.reply_text(
@@ -470,10 +480,7 @@ class TelegramBot:
         except ValueError:
             await update.message.reply_text("Invalid number. Usage: /setlev 3")
 
-    # ── Run the command listener ──
-
     def start_command_listener(self):
-        """Start the Telegram command listener in a background thread."""
         thread = threading.Thread(target=self._run_polling, daemon=True)
         thread.start()
         logger.info("Telegram command listener started")
@@ -490,7 +497,6 @@ class TelegramBot:
         app.add_handler(CommandHandler("help", self._cmd_help))
         app.add_handler(CommandHandler("status", self._cmd_status))
         app.add_handler(CommandHandler("levels", self._cmd_levels))
-        app.add_handler(CommandHandler("orders", self._cmd_orders))
         app.add_handler(CommandHandler("pnl", self._cmd_pnl))
         app.add_handler(CommandHandler("config", self._cmd_config))
         app.add_handler(CommandHandler("risk", self._cmd_risk))
@@ -504,10 +510,8 @@ class TelegramBot:
         await app.start()
         await app.updater.start_polling(drop_pending_updates=True)
 
-        # Keep running until the process exits
         stop_event = asyncio.Event()
         await stop_event.wait()
 
 
-# Keep backward compat alias
 TelegramNotifier = TelegramBot

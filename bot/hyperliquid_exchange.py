@@ -31,7 +31,6 @@ class HyperliquidExchange:
             self._set_leverage()
 
     def _set_leverage(self):
-        """Set leverage to 1x for the trading symbol."""
         if self.exchange is None:
             return
         try:
@@ -45,7 +44,6 @@ class HyperliquidExchange:
             logger.error(f"Failed to set leverage: {e}")
 
     def fetch_ohlcv(self, timeframe: str | None = None, lookback: int | None = None) -> pd.DataFrame:
-        """Fetch candle data from Hyperliquid."""
         interval = timeframe or self.config.timeframe
         candles = lookback or self.config.lookback_candles
         now_ms = int(time.time() * 1000)
@@ -76,7 +74,6 @@ class HyperliquidExchange:
         return df
 
     def get_ticker_price(self) -> float:
-        """Get current mid price."""
         mids = self.info.all_mids()
         price = mids.get(self.config.hl_symbol)
         if price is None:
@@ -84,11 +81,9 @@ class HyperliquidExchange:
         return float(price)
 
     def get_account_state(self) -> dict:
-        """Get account margin and position info."""
         return self.info.user_state(self.address)
 
     def place_market_buy(self, amount_quote: float) -> dict:
-        """Place a market buy (long) order."""
         price = self.get_ticker_price()
         quantity = round(amount_quote / price, 4)
 
@@ -127,8 +122,82 @@ class HyperliquidExchange:
             "raw": result,
         }
 
+    def place_market_short(self, amount_quote: float) -> dict:
+        price = self.get_ticker_price()
+        quantity = round(amount_quote / price, 4)
+
+        if self.config.paper_trade:
+            order = {
+                "id": "paper-trade",
+                "symbol": self.config.hl_symbol,
+                "side": "sell",
+                "type": "market",
+                "amount": quantity,
+                "price": price,
+                "cost": amount_quote,
+                "status": "filled",
+                "paper": True,
+            }
+            logger.info(f"[PAPER] Short {quantity} {self.config.hl_symbol} @ {price:.2f}")
+            return order
+
+        result = self.exchange.market_open(
+            name=self.config.hl_symbol,
+            is_buy=False,
+            sz=quantity,
+            slippage=0.01,
+        )
+        logger.info(f"[LIVE] Market short placed: {result}")
+        return {
+            "id": str(result),
+            "symbol": self.config.hl_symbol,
+            "side": "sell",
+            "type": "market",
+            "amount": quantity,
+            "price": price,
+            "cost": amount_quote,
+            "status": "filled",
+            "paper": False,
+            "raw": result,
+        }
+
+    def place_market_close(self, quantity: float, side: str = "long") -> dict:
+        price = self.get_ticker_price()
+
+        if self.config.paper_trade:
+            close_side = "sell" if side == "long" else "buy"
+            order = {
+                "id": "paper-trade",
+                "symbol": self.config.hl_symbol,
+                "side": close_side,
+                "type": "market",
+                "amount": quantity,
+                "price": price,
+                "status": "filled",
+                "paper": True,
+            }
+            logger.info(f"[PAPER] Close {side} {quantity} {self.config.hl_symbol} @ {price:.2f}")
+            return order
+
+        result = self.exchange.market_close(
+            coin=self.config.hl_symbol,
+            sz=quantity,
+            slippage=0.01,
+        )
+        logger.info(f"[LIVE] Market close {side} placed: {result}")
+        return {
+            "id": str(result),
+            "symbol": self.config.hl_symbol,
+            "side": "sell" if side == "long" else "buy",
+            "type": "market",
+            "amount": quantity,
+            "price": price,
+            "status": "filled",
+            "paper": False,
+            "raw": result,
+        }
+
     def place_limit_buy(self, price: float, amount_quote: float) -> dict:
-        """Place a limit buy order at a specific price."""
         quantity = round(amount_quote / price, 4)
 
         if self.config.paper_trade:
@@ -176,7 +245,6 @@ class HyperliquidExchange:
         }
 
     def cancel_order(self, price: float, oid: int) -> dict:
-        """Cancel an open order by oid."""
         if self.config.paper_trade:
             return {"status": "cancelled", "paper": True}
 
@@ -184,41 +252,9 @@ class HyperliquidExchange:
         logger.info(f"[LIVE] Order cancelled: oid={oid}")
         return result
 
+    # Keep backward compat
     def place_market_sell(self, quantity: float) -> dict:
-        """Close a long position."""
-        price = self.get_ticker_price()
-
-        if self.config.paper_trade:
-            order = {
-                "id": "paper-trade",
-                "symbol": self.config.hl_symbol,
-                "side": "sell",
-                "type": "market",
-                "amount": quantity,
-                "price": price,
-                "status": "filled",
-                "paper": True,
-            }
-            logger.info(f"[PAPER] Close {quantity} {self.config.hl_symbol} @ {price:.2f}")
-            return order
-
-        result = self.exchange.market_close(
-            coin=self.config.hl_symbol,
-            sz=quantity,
-            slippage=0.01,
-        )
-        logger.info(f"[LIVE] Market close placed: {result}")
-        return {
-            "id": str(result),
-            "symbol": self.config.hl_symbol,
-            "side": "sell",
-            "type": "market",
-            "amount": quantity,
-            "price": price,
-            "status": "filled",
-            "paper": False,
-            "raw": result,
-        }
+        return self.place_market_close(quantity, side="long")
 
     @staticmethod
     def _interval_to_ms(interval: str) -> int:

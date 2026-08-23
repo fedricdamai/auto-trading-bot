@@ -2,7 +2,10 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from bot.levels import detect_levels, get_limit_order_prices, _find_swing_points, _cluster_levels, _analyze_level
+from bot.levels import (
+    detect_levels, get_limit_order_prices, _find_swing_points,
+    _cluster_levels, _analyze_level, compute_tp_sl, detect_doji,
+)
 
 
 def _make_candles(prices: list[float], volumes: list[float] | None = None) -> pd.DataFrame:
@@ -94,31 +97,91 @@ class TestGetLimitOrderPrices:
         ]
         orders = get_limit_order_prices(levels, current_price=62000, leverage=3, target_pnl_pct=1.0, max_loss_pct=1.0, max_orders=5)
         assert len(orders) > 0
-        assert all("sl_price" in o and "tp_price" in o for o in orders)
         for o in orders:
-            assert o["tp_price"] > o["price"]
-            assert o["sl_price"] < o["price"]
-            assert o["sl_price"] > o["liq_price"]
+            assert "sl_price" in o
+            assert "tp_price" in o
+            assert "side" in o
+
+    def test_support_orders_are_long(self):
+        from bot.levels import Level
+        levels = [
+            Level(price=60000, kind="support", touches=5, strength=80, volume_avg=1000, last_touch_idx=190),
+        ]
+        orders = get_limit_order_prices(levels, current_price=62000, leverage=3)
+        assert len(orders) == 1
+        assert orders[0]["side"] == "long"
+        assert orders[0]["tp_price"] > orders[0]["price"]
+        assert orders[0]["sl_price"] < orders[0]["price"]
+
+    def test_resistance_orders_are_short(self):
+        from bot.levels import Level
+        levels = [
+            Level(price=65000, kind="resistance", touches=3, strength=60, volume_avg=800, last_touch_idx=195),
+        ]
+        orders = get_limit_order_prices(levels, current_price=62000, leverage=3)
+        assert len(orders) == 1
+        assert orders[0]["side"] == "short"
+        assert orders[0]["tp_price"] < orders[0]["price"]
+        assert orders[0]["sl_price"] > orders[0]["price"]
 
 
 class TestComputeTpSl:
-    def test_1pct_target_3x_leverage(self):
-        from bot.levels import compute_tp_sl
-        result = compute_tp_sl(entry=100000, leverage=3, target_pnl_pct=1.0, max_loss_pct=1.0)
+    def test_long_1pct_target_3x_leverage(self):
+        result = compute_tp_sl(entry=100000, leverage=3, target_pnl_pct=1.0, max_loss_pct=1.0, side="long")
         assert result["tp_price"] > 100000
         assert result["sl_price"] < 100000
         assert result["sl_price"] > result["liq_price"]
-        expected_tp_move = 1.0 / 3  # ~0.333%
+        expected_tp_move = 1.0 / 3
         assert abs(result["tp_move_pct"] - expected_tp_move) < 0.01
 
-    def test_sl_above_liquidation(self):
-        from bot.levels import compute_tp_sl
-        result = compute_tp_sl(entry=100000, leverage=5, target_pnl_pct=1.0, max_loss_pct=50.0)
+    def test_short_1pct_target_3x_leverage(self):
+        result = compute_tp_sl(entry=100000, leverage=3, target_pnl_pct=1.0, max_loss_pct=1.0, side="short")
+        assert result["tp_price"] < 100000
+        assert result["sl_price"] > 100000
+        assert result["sl_price"] < result["liq_price"]
+
+    def test_sl_above_liquidation_long(self):
+        result = compute_tp_sl(entry=100000, leverage=5, target_pnl_pct=1.0, max_loss_pct=50.0, side="long")
         assert result["sl_price"] > result["liq_price"]
 
+    def test_sl_below_liquidation_short(self):
+        result = compute_tp_sl(entry=100000, leverage=5, target_pnl_pct=1.0, max_loss_pct=50.0, side="short")
+        assert result["sl_price"] < result["liq_price"]
+
     def test_higher_leverage_tighter_moves(self):
-        from bot.levels import compute_tp_sl
         r1 = compute_tp_sl(entry=100000, leverage=1, target_pnl_pct=1.0, max_loss_pct=1.0)
         r5 = compute_tp_sl(entry=100000, leverage=5, target_pnl_pct=1.0, max_loss_pct=1.0)
         assert r5["tp_move_pct"] < r1["tp_move_pct"]
         assert r5["sl_move_pct"] < r1["sl_move_pct"]
+
+    def test_default_side_is_long(self):
+        r_default = compute_tp_sl(entry=100000, leverage=3, target_pnl_pct=1.0, max_loss_pct=1.0)
+        r_long = compute_tp_sl(entry=100000, leverage=3, target_pnl_pct=1.0, max_loss_pct=1.0, side="long")
+        assert r_default == r_long
+
+
+class TestDetectDoji:
+    def test_no_doji_on_normal_candles(self):
+        prices = list(range(100, 120))
+        df = _make_candles(prices)
+        assert detect_doji(df) is None
+
+    def test_detects_doji_with_big_range(self):
+        n = 10
+        base = [100.0] * n
+        df_data = {
+            "open": base + [100.0, 100.0],
+            "high": [p + 1 for p in base] + [106.0, 101.0],
+            "low": [p - 1 for p in base] + [94.0, 99.0],
+            "close": base + [100.1, 100.0],
+            "volume": [100] * (n + 2),
+        }
+        df = pd.DataFrame(df_data)
+        signal = detect_doji(df)
+        assert signal is not None
+        assert signal.signal in ("bullish", "bearish", "neutral")
+        assert signal.strength > 0
+
+    def test_too_few_candles(self):
+        df = _make_candles([100, 101, 102])
+        assert detect_doji(df) is None

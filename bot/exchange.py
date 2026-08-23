@@ -20,7 +20,6 @@ class Exchange:
         })
 
     def fetch_ohlcv(self, timeframe: str | None = None, lookback: int | None = None) -> pd.DataFrame:
-        """Fetch OHLCV candles and return as a DataFrame."""
         raw = self.client.fetch_ohlcv(
             self.config.symbol,
             timeframe=timeframe or self.config.timeframe,
@@ -35,7 +34,6 @@ class Exchange:
         return float(ticker["last"])
 
     def place_market_buy(self, amount_quote: float) -> dict:
-        """Place a market buy order for a given quote-currency amount."""
         price = self.get_ticker_price()
         quantity = amount_quote / price
 
@@ -51,18 +49,62 @@ class Exchange:
                 "status": "filled",
                 "paper": True,
             }
-            logger.info(f"[PAPER] Buy {quantity:.6f} @ {price:.2f}")
+            logger.info(f"[PAPER] Long {quantity:.6f} @ {price:.2f}")
             return order
 
-        order = self.client.create_market_buy_order(
-            self.config.symbol,
-            quantity,
-        )
-        logger.info(f"[LIVE] Buy order placed: {order['id']}")
+        order = self.client.create_market_buy_order(self.config.symbol, quantity)
+        logger.info(f"[LIVE] Long order placed: {order['id']}")
+        return order
+
+    def place_market_short(self, amount_quote: float) -> dict:
+        price = self.get_ticker_price()
+        quantity = amount_quote / price
+
+        if self.config.paper_trade:
+            order = {
+                "id": "paper-trade",
+                "symbol": self.config.symbol,
+                "side": "sell",
+                "type": "market",
+                "amount": quantity,
+                "price": price,
+                "cost": amount_quote,
+                "status": "filled",
+                "paper": True,
+            }
+            logger.info(f"[PAPER] Short {quantity:.6f} @ {price:.2f}")
+            return order
+
+        order = self.client.create_market_sell_order(self.config.symbol, quantity)
+        logger.info(f"[LIVE] Short order placed: {order['id']}")
+        return order
+
+    def place_market_close(self, quantity: float, side: str = "long") -> dict:
+        price = self.get_ticker_price()
+
+        if self.config.paper_trade:
+            close_side = "sell" if side == "long" else "buy"
+            order = {
+                "id": "paper-trade",
+                "symbol": self.config.symbol,
+                "side": close_side,
+                "type": "market",
+                "amount": quantity,
+                "price": price,
+                "status": "filled",
+                "paper": True,
+            }
+            logger.info(f"[PAPER] Close {side} {quantity:.6f} @ {price:.2f}")
+            return order
+
+        if side == "long":
+            order = self.client.create_market_sell_order(self.config.symbol, quantity)
+        else:
+            order = self.client.create_market_buy_order(self.config.symbol, quantity)
+        logger.info(f"[LIVE] Close {side} placed: {order['id']}")
         return order
 
     def place_limit_buy(self, price: float, amount_quote: float) -> dict:
-        """Place a limit buy order at a specific price."""
         quantity = amount_quote / price
 
         if self.config.paper_trade:
@@ -80,10 +122,6 @@ class Exchange:
             logger.info(f"[PAPER] Limit buy {quantity:.6f} @ {price:.2f}")
             return order
 
-        order = self.client.create_limit_buy_order(
-            self.config.symbol,
-            quantity,
-            price,
-        )
-        logger.info(f"[LIVE] Limit buy order placed: {order['id']} @ {price:.2f}")
+        order = self.client.create_limit_buy_order(self.config.symbol, quantity, price)
+        logger.info(f"[LIVE] Limit buy placed: {order['id']} @ {price:.2f}")
         return order
