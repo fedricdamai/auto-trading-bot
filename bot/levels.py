@@ -1,6 +1,6 @@
 import numpy as np
 import pandas as pd
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass
@@ -23,6 +23,25 @@ class DojiSignal:
     candle_range: float  # total range of the doji candle
 
 
+@dataclass
+class TrendBias:
+    direction: str     # "bullish", "bearish", or "neutral"
+    confidence: float  # 0-100
+    tf_details: dict = field(default_factory=dict)
+
+
+@dataclass
+class BreakoutCheck:
+    is_breakout: bool
+    is_fakeout: bool
+    confidence: float          # 0-100 how confident we are
+    volume_confirmed: bool
+    momentum_confirmed: bool
+    trend_aligned: bool
+    retest_seen: bool
+    details: str = ""
+
+
 TF_WEIGHTS = {"1d": 1.5, "4h": 1.0, "1h": 0.6, "5m": 0.3}
 
 FIB_RATIOS = {
@@ -39,6 +58,235 @@ MULTI_TF_CONFIGS = [
     {"timeframe": "1h", "lookback": 500},
     {"timeframe": "5m", "lookback": 500},
 ]
+
+
+def _ema(values: np.ndarray, period: int) -> np.ndarray:
+    alpha = 2 / (period + 1)
+    ema = np.empty_like(values, dtype=float)
+    ema[0] = values[0]
+    for i in range(1, len(values)):
+        ema[i] = alpha * values[i] + (1 - alpha) * ema[i - 1]
+    return ema
+
+
+def _rsi(closes: np.ndarray, period: int = 14) -> float:
+    if len(closes) < period + 1:
+        return 50.0
+    deltas = np.diff(closes[-(period + 1):])
+    gains = np.where(deltas > 0, deltas, 0)
+    losses = np.where(deltas < 0, -deltas, 0)
+    avg_gain = np.mean(gains) if len(gains) else 0
+    avg_loss = np.mean(losses) if len(losses) else 1e-10
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
+
+
+def _macd(closes: np.ndarray) -> tuple[float, float]:
+    if len(closes) < 26:
+        return 0.0, 0.0
+    ema12 = _ema(closes, 12)
+    ema26 = _ema(closes, 26)
+    macd_line = ema12 - ema26
+    signal_line = _ema(macd_line[-9:], 9) if len(macd_line) >= 9 else macd_line[-1:]
+    return float(macd_line[-1]), float(signal_line[-1])
+
+
+def compute_trend_bias(exchange) -> TrendBias:
+    tf_configs = [
+        {"timeframe": "1m", "lookback": 100, "weight": 0.2},
+        {"timeframe": "5m", "lookback": 100, "weight": 0.35},
+        {"timeframe": "15m", "lookback": 100, "weight": 0.45},
+    ]
+
+    bullish_score = 0.0
+    bearish_score = 0.0
+    tf_details = {}
+
+    for cfg in tf_configs:
+        tf = cfg["timeframe"]
+        try:
+            df = exchange.fetch_ohlcv(timeframe=tf, lookback=cfg["lookback"])
+            closes = df["close"].values
+            if len(closes) < 21:
+                continue
+
+            ema9 = _ema(closes, 9)
+            ema21 = _ema(closes, 21)
+
+            ema9_now = ema9[-1]
+            ema21_now = ema21[-1]
+            price_now = closes[-1]
+
+            ema_cross = "bullish" if ema9_now > ema21_now else "bearish"
+            price_vs_ema = "above" if price_now > ema21_now else "below"
+
+            ema9_prev = ema9[-3]
+            ema21_prev = ema21[-3]
+            ema9_slope = (ema9_now - ema9_prev) / ema9_prev * 100
+            ema21_slope = (ema21_now - ema21_prev) / ema21_prev * 100
+
+            tf_score = 0
+            if ema_cross == "bullish":
+                tf_score += 1
+            else:
+                tf_score -= 1
+            if price_vs_ema == "above":
+                tf_score += 1
+            else:
+                tf_score -= 1
+            if ema9_slope > 0 and ema21_slope > 0:
+                tf_score += 0.5
+            elif ema9_slope < 0 and ema21_slope < 0:
+                tf_score -= 0.5
+
+            w = cfg["weight"]
+            if tf_score > 0:
+                bullish_score += abs(tf_score) * w
+            else:
+                bearish_score += abs(tf_score) * w
+
+            tf_details[tf] = {
+                "ema_cross": ema_cross,
+                "price_vs_ema21": price_vs_ema,
+                "ema9": round(ema9_now, 2),
+                "ema21": round(ema21_now, 2),
+                "price": round(price_now, 2),
+                "ema9_slope": round(ema9_slope, 4),
+                "score": round(tf_score, 2),
+            }
+        except Exception as e:
+            tf_details[tf] = {"error": str(e)}
+            continue
+
+    total = bullish_score + bearish_score
+    if total == 0:
+        return TrendBias(direction="neutral", confidence=0, tf_details=tf_details)
+
+    if bullish_score > bearish_score:
+        direction = "bullish"
+        confidence = (bullish_score / total) * 100
+    elif bearish_score > bullish_score:
+        direction = "bearish"
+        confidence = (bearish_score / total) * 100
+    else:
+        direction = "neutral"
+        confidence = 50
+
+    return TrendBias(
+        direction=direction,
+        confidence=round(min(confidence, 100), 1),
+        tf_details=tf_details,
+    )
+
+
+def check_breakout_fakeout(
+    exchange, level: "Level", current_price: float,
+) -> BreakoutCheck:
+    try:
+        df = exchange.fetch_ohlcv(timeframe="5m", lookback=60)
+    except Exception:
+        return BreakoutCheck(
+            is_breakout=False, is_fakeout=False, confidence=0,
+            volume_confirmed=False, momentum_confirmed=False,
+            trend_aligned=False, retest_seen=False,
+            details="Could not fetch candle data",
+        )
+
+    closes = df["close"].values
+    volumes = df["volume"].values
+    highs = df["high"].values
+    lows = df["low"].values
+
+    distance_pct = abs(current_price - level.price) / level.price * 100
+    broke_through = (
+        (level.kind == "resistance" and current_price > level.price)
+        or (level.kind == "support" and current_price < level.price)
+    )
+
+    if not broke_through and distance_pct > 0.5:
+        return BreakoutCheck(
+            is_breakout=False, is_fakeout=False, confidence=0,
+            volume_confirmed=False, momentum_confirmed=False,
+            trend_aligned=False, retest_seen=False,
+            details="Price has not reached the level yet",
+        )
+
+    recent_vol = np.mean(volumes[-5:]) if len(volumes) >= 5 else np.mean(volumes)
+    avg_vol = np.mean(volumes[-30:]) if len(volumes) >= 30 else np.mean(volumes)
+    volume_confirmed = recent_vol > avg_vol * 1.5
+
+    rsi_val = _rsi(closes)
+    macd_val, macd_signal = _macd(closes)
+
+    if level.kind == "resistance":
+        momentum_confirmed = rsi_val > 55 and macd_val > macd_signal
+    else:
+        momentum_confirmed = rsi_val < 45 and macd_val < macd_signal
+
+    try:
+        trend = compute_trend_bias(exchange)
+        if level.kind == "resistance":
+            trend_aligned = trend.direction == "bullish" and trend.confidence >= 55
+        else:
+            trend_aligned = trend.direction == "bearish" and trend.confidence >= 55
+    except Exception:
+        trend_aligned = False
+        trend = None
+
+    retest_seen = False
+    if broke_through and len(closes) >= 10:
+        last_10_lows = lows[-10:]
+        last_10_highs = highs[-10:]
+        tol = level.price * 0.003
+
+        if level.kind == "resistance":
+            retouched = any(abs(lo - level.price) <= tol for lo in last_10_lows)
+            held_above = closes[-1] > level.price
+            retest_seen = retouched and held_above
+        else:
+            retouched = any(abs(hi - level.price) <= tol for hi in last_10_highs)
+            held_below = closes[-1] < level.price
+            retest_seen = retouched and held_below
+
+    score = 0
+    checks_passed = 0
+    total_checks = 4
+
+    if volume_confirmed:
+        score += 30
+        checks_passed += 1
+    if momentum_confirmed:
+        score += 25
+        checks_passed += 1
+    if trend_aligned:
+        score += 25
+        checks_passed += 1
+    if retest_seen:
+        score += 20
+        checks_passed += 1
+
+    is_breakout = broke_through and checks_passed >= 3
+    is_fakeout = broke_through and checks_passed <= 1
+
+    details_parts = []
+    details_parts.append(f"Vol: {'OK' if volume_confirmed else 'LOW'} ({recent_vol:.0f} vs avg {avg_vol:.0f})")
+    details_parts.append(f"RSI: {rsi_val:.1f} MACD: {macd_val:.4f}/{macd_signal:.4f}")
+    details_parts.append(f"Trend: {trend.direction if trend else '?'} ({trend.confidence if trend else 0:.0f}%)")
+    details_parts.append(f"Retest: {'YES' if retest_seen else 'NO'}")
+    details_parts.append(f"Score: {checks_passed}/{total_checks} checks passed")
+
+    return BreakoutCheck(
+        is_breakout=is_breakout,
+        is_fakeout=is_fakeout,
+        confidence=round(min(score, 100), 1),
+        volume_confirmed=volume_confirmed,
+        momentum_confirmed=momentum_confirmed,
+        trend_aligned=trend_aligned,
+        retest_seen=retest_seen,
+        details=" | ".join(details_parts),
+    )
 
 
 def detect_levels(df: pd.DataFrame, tolerance_pct: float, min_touches: int) -> list[Level]:

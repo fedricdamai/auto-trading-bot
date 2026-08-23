@@ -5,7 +5,8 @@ from dataclasses import dataclass
 from bot.config import Config
 from bot.levels import (
     detect_levels, detect_levels_multi_tf, compute_tp_sl, detect_doji,
-    Level, DojiSignal,
+    compute_trend_bias, check_breakout_fakeout,
+    Level, DojiSignal, TrendBias, BreakoutCheck,
 )
 from bot.telegram_notifier import TelegramNotifier
 from bot.trade_journal import TradeJournal, TradeRecord
@@ -64,6 +65,7 @@ class Trader:
         self.last_doji_check: float = 0
         self.last_doji_signal: DojiSignal | None = None
         self.last_exit_time: float = 0
+        self.last_trend_bias: TrendBias | None = None
         self._synced: bool = False
 
         self.journal = TradeJournal()
@@ -257,7 +259,7 @@ class Trader:
 
     # ── Best-level selection ─────────────────────────────────────────
 
-    def _find_best_level(self, current_price: float) -> tuple[Level | None, float]:
+    def _find_best_level(self, current_price: float, trend: TrendBias | None = None) -> tuple[Level | None, float]:
         """Return the single highest-confidence level and its effective strength."""
         if not self.known_levels:
             return None, 0
@@ -272,6 +274,12 @@ class Trader:
             tfs = level.timeframes or []
             if len(tfs) < lp.min_timeframes:
                 continue
+
+            if trend and trend.confidence >= 55:
+                if trend.direction == "bullish" and level.kind == "resistance":
+                    continue
+                if trend.direction == "bearish" and level.kind == "support":
+                    continue
 
             distance_pct = abs(current_price - level.price) / level.price * 100
             if distance_pct > 10:
@@ -308,14 +316,24 @@ class Trader:
     def _place_best_order(self, current_price: float):
         """Ensure exactly 1 limit order at the best S/R level.
 
-        Uses the exchange as source of truth — checks real orders/position
-        every tick to prevent duplicates even after restarts.
+        Runs trend bias + breakout/fakeout analysis and sends a decision
+        report to Telegram before placing or skipping.
         """
         position = self.exchange.get_position()
         if position and position["size"] > 0:
             return
 
-        best_level, best_strength = self._find_best_level(current_price)
+        try:
+            trend = compute_trend_bias(self.exchange)
+            self.last_trend_bias = trend
+            logger.info(
+                f"Trend bias: {trend.direction.upper()} ({trend.confidence:.0f}%)"
+            )
+        except Exception as e:
+            logger.warning(f"Trend bias computation failed: {e}")
+            trend = TrendBias(direction="neutral", confidence=0)
+
+        best_level, best_strength = self._find_best_level(current_price, trend)
         if not best_level:
             return
 
@@ -327,6 +345,83 @@ class Trader:
                 diff_pct = abs(best_level.price - existing_price) / existing_price * 100
                 if diff_pct < 0.5:
                     return
+
+        try:
+            bo_check = check_breakout_fakeout(self.exchange, best_level, current_price)
+        except Exception as e:
+            logger.warning(f"Breakout check failed: {e}")
+            bo_check = BreakoutCheck(
+                is_breakout=False, is_fakeout=False, confidence=0,
+                volume_confirmed=False, momentum_confirmed=False,
+                trend_aligned=False, retest_seen=False, details=str(e),
+            )
+
+        distance_pct = abs(current_price - best_level.price) / best_level.price * 100
+        report = {
+            "level": {
+                "price": best_level.price,
+                "kind": best_level.kind,
+                "strength": best_level.strength,
+                "effective_strength": round(best_strength, 1),
+                "timeframes": ",".join(best_level.timeframes) if best_level.timeframes else "-",
+                "fib_ratio": best_level.fib_ratio,
+                "distance_pct": round(distance_pct, 2),
+            },
+            "trend": {
+                "direction": trend.direction,
+                "confidence": trend.confidence,
+                "tf_details": trend.tf_details,
+            },
+            "breakout": {
+                "is_breakout": bo_check.is_breakout,
+                "is_fakeout": bo_check.is_fakeout,
+                "confidence": bo_check.confidence,
+                "volume_confirmed": bo_check.volume_confirmed,
+                "momentum_confirmed": bo_check.momentum_confirmed,
+                "trend_aligned": bo_check.trend_aligned,
+                "retest_seen": bo_check.retest_seen,
+                "details": bo_check.details,
+            },
+        }
+
+        if bo_check.is_fakeout:
+            report["decision"] = "SKIP (FAKEOUT)"
+            report["reason"] = (
+                f"Level {best_level.price:.2f} breakout flagged as fakeout "
+                f"({bo_check.confidence:.0f}% conf). Not placing order."
+            )
+            logger.info(f"SKIP fakeout at {best_level.kind} {best_level.price:.2f}: {bo_check.details}")
+            if self.notifier:
+                self.notifier.notify_decision_report(report)
+            return
+
+        if trend.confidence >= 55:
+            if trend.direction == "bullish" and best_level.kind == "resistance":
+                report["decision"] = "SKIP (TREND CONFLICT)"
+                report["reason"] = "Trend is bullish but best level is resistance — skipping."
+                logger.info("SKIP: bullish trend vs resistance level")
+                if self.notifier:
+                    self.notifier.notify_decision_report(report)
+                return
+            if trend.direction == "bearish" and best_level.kind == "support":
+                report["decision"] = "SKIP (TREND CONFLICT)"
+                report["reason"] = "Trend is bearish but best level is support — skipping."
+                logger.info("SKIP: bearish trend vs support level")
+                if self.notifier:
+                    self.notifier.notify_decision_report(report)
+                return
+
+        side = "long" if best_level.kind == "support" else "short"
+        report["decision"] = f"PLACE {side.upper()}"
+        report["reason"] = (
+            f"Placing limit {side} at {best_level.kind} {best_level.price:.2f} | "
+            f"Trend: {trend.direction} ({trend.confidence:.0f}%) | "
+            f"Breakout conf: {bo_check.confidence:.0f}%"
+        )
+
+        logger.info(f"DECISION: {report['decision']} — {report['reason']}")
+        if self.notifier:
+            self.notifier.notify_decision_report(report)
 
         if open_orders:
             self.exchange.cancel_all_orders()
@@ -499,7 +594,7 @@ class Trader:
         if not order:
             return
 
-        best_level, best_strength = self._find_best_level(current_price)
+        best_level, best_strength = self._find_best_level(current_price, self.last_trend_bias)
         if not best_level:
             return
 

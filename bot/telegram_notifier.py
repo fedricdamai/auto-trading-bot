@@ -141,6 +141,65 @@ class TelegramBot:
             f"Limit {label} at {level_type} <code>{level:.2f}</code>"
         )
 
+    def notify_decision_report(self, report: dict):
+        r = report
+        trend = r.get("trend", {})
+        breakout = r.get("breakout", {})
+        level = r.get("level", {})
+        decision = r.get("decision", "SKIP")
+        reason = r.get("reason", "")
+
+        trend_dir = trend.get("direction", "?").upper()
+        trend_conf = trend.get("confidence", 0)
+        tf_lines = []
+        for tf, detail in trend.get("tf_details", {}).items():
+            if isinstance(detail, dict) and "error" not in detail:
+                tf_lines.append(
+                    f"  {tf}: EMA {detail.get('ema_cross', '?')} | "
+                    f"Price {'>' if detail.get('price_vs_ema21') == 'above' else '<'} EMA21 | "
+                    f"Score: {detail.get('score', '?')}"
+                )
+
+        bo_conf = breakout.get("confidence", 0)
+        vol_ok = "Y" if breakout.get("volume_confirmed") else "N"
+        mom_ok = "Y" if breakout.get("momentum_confirmed") else "N"
+        trend_ok = "Y" if breakout.get("trend_aligned") else "N"
+        retest_ok = "Y" if breakout.get("retest_seen") else "N"
+        bo_verdict = "BREAKOUT" if breakout.get("is_breakout") else ("FAKEOUT" if breakout.get("is_fakeout") else "UNCLEAR")
+
+        fib_tag = f" (Fib {level.get('fib_ratio')})" if level.get("fib_ratio") else ""
+
+        msg = (
+            f"<b>DECISION REPORT</b>\n"
+            f"{'=' * 28}\n\n"
+            f"<b>1. TRIGGER</b>\n"
+            f"Level: <code>{level.get('price', '?')}</code> ({level.get('kind', '?')}{fib_tag})\n"
+            f"Strength: <code>{level.get('strength', '?')}</code> | "
+            f"Eff: <code>{level.get('effective_strength', '?')}</code>\n"
+            f"TFs: <code>{level.get('timeframes', '?')}</code>\n"
+            f"Distance: <code>{level.get('distance_pct', '?')}%</code>\n\n"
+            f"<b>2. TREND BIAS (1M/5M/15M)</b>\n"
+            f"Direction: <code>{trend_dir}</code> ({trend_conf:.0f}%)\n"
+        )
+        if tf_lines:
+            msg += "<code>" + "\n".join(tf_lines) + "</code>\n"
+        msg += (
+            f"\n<b>3. BREAKOUT CHECK</b>\n"
+            f"Verdict: <code>{bo_verdict}</code> ({bo_conf:.0f}%)\n"
+            f"  Volume:   <code>[{vol_ok}]</code>\n"
+            f"  Momentum: <code>[{mom_ok}]</code>\n"
+            f"  Trend:    <code>[{trend_ok}]</code>\n"
+            f"  Retest:   <code>[{retest_ok}]</code>\n"
+        )
+        if breakout.get("details"):
+            msg += f"  <code>{breakout['details']}</code>\n"
+        msg += (
+            f"\n<b>4. DECISION: {decision}</b>\n"
+            f"{reason}"
+        )
+
+        self.send(msg)
+
     def notify_buy(self, level: float, level_type: str, price: float, quantity: float, sl: float, tp: float):
         self.notify_entry("long", level, level_type, price, quantity, sl, tp, 1)
 
