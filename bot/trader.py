@@ -548,9 +548,15 @@ class Trader:
 
         try:
             if side == "long":
-                order = self.exchange.place_limit_buy(entry_price, order_size)
+                order = self.exchange.place_limit_buy(
+                    entry_price, order_size,
+                    tp_price=tpsl["tp_price"], sl_price=tpsl["sl_price"],
+                )
             else:
-                order = self.exchange.place_limit_sell(entry_price, order_size)
+                order = self.exchange.place_limit_sell(
+                    entry_price, order_size,
+                    tp_price=tpsl["tp_price"], sl_price=tpsl["sl_price"],
+                )
 
             if order.get("status") == "filled":
                 self._create_position_from_fill(
@@ -669,16 +675,6 @@ class Trader:
             f"[{symbol}] FILLED — {side.upper()} @ {fill_price:.2f} | "
             f"Qty: {quantity} | SL: {tpsl['sl_price']:.2f} | TP: {tpsl['tp_price']:.2f}"
         )
-
-        try:
-            self.exchange.place_tp_sl_orders(
-                quantity, side, tpsl["tp_price"], tpsl["sl_price"],
-            )
-            logger.info(f"[{symbol}] TP/SL triggers placed")
-        except Exception as e:
-            logger.error(f"[{symbol}] TP/SL trigger placement failed: {e}")
-            if self.notifier:
-                self.notifier.notify_error(f"{symbol} TP/SL failed: {e}")
 
         if self.notifier:
             self.notifier.notify_entry(

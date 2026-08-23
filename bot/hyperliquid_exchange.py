@@ -398,8 +398,9 @@ class HyperliquidExchange:
             "status": "filled", "paper": False, "raw": result,
         }
 
-    def place_limit_buy(self, price: float, amount_quote: float) -> dict:
-        """Place a limit buy (long entry) order."""
+    def place_limit_buy(self, price: float, amount_quote: float,
+                        tp_price: float = 0, sl_price: float = 0) -> dict:
+        """Place a limit buy (long entry) order, optionally with TP/SL attached."""
         price = self._round_price(price)
         quantity = self._round_size(amount_quote / price)
 
@@ -411,6 +412,12 @@ class HyperliquidExchange:
                 "amount": quantity, "price": price, "cost": amount_quote,
                 "status": "open", "paper": True,
             }
+
+        if tp_price > 0 and sl_price > 0:
+            return self._place_limit_with_tpsl(
+                is_buy=True, price=price, quantity=quantity,
+                tp_price=tp_price, sl_price=sl_price, amount_quote=amount_quote,
+            )
 
         logger.info(f"[LIVE] Submitting limit buy: price={price} sz={quantity} (szDec={self._sz_decimals})")
         result = self.exchange.order(
@@ -428,8 +435,9 @@ class HyperliquidExchange:
             "paper": False, "raw": result,
         }
 
-    def place_limit_sell(self, price: float, amount_quote: float) -> dict:
-        """Place a limit sell (short entry) order."""
+    def place_limit_sell(self, price: float, amount_quote: float,
+                         tp_price: float = 0, sl_price: float = 0) -> dict:
+        """Place a limit sell (short entry) order, optionally with TP/SL attached."""
         price = self._round_price(price)
         quantity = self._round_size(amount_quote / price)
 
@@ -442,6 +450,12 @@ class HyperliquidExchange:
                 "status": "open", "paper": True,
             }
 
+        if tp_price > 0 and sl_price > 0:
+            return self._place_limit_with_tpsl(
+                is_buy=False, price=price, quantity=quantity,
+                tp_price=tp_price, sl_price=sl_price, amount_quote=amount_quote,
+            )
+
         logger.info(f"[LIVE] Submitting limit sell: price={price} sz={quantity} (szDec={self._sz_decimals})")
         result = self.exchange.order(
             name=self.config.hl_symbol, is_buy=False, sz=quantity,
@@ -453,6 +467,54 @@ class HyperliquidExchange:
         return {
             "id": str(result), "oid": parsed["oid"],
             "symbol": self.config.hl_symbol, "side": "sell", "type": "limit",
+            "amount": parsed["fill_sz"], "price": parsed["fill_price"],
+            "cost": amount_quote, "status": parsed["status"],
+            "paper": False, "raw": result,
+        }
+
+    def _place_limit_with_tpsl(self, is_buy: bool, price: float, quantity: float,
+                                tp_price: float, sl_price: float, amount_quote: float) -> dict:
+        """Place entry + TP + SL as a grouped order so TP/SL show on the exchange."""
+        coin = self.config.hl_symbol
+        tp_price = self._round_price(tp_price)
+        sl_price = self._round_price(sl_price)
+        is_close = not is_buy
+        side_label = "buy" if is_buy else "sell"
+
+        entry_order = {
+            "coin": coin, "is_buy": is_buy, "sz": quantity,
+            "limit_px": price, "order_type": {"limit": {"tif": "Gtc"}},
+            "reduce_only": False,
+        }
+        tp_order = {
+            "coin": coin, "is_buy": is_close, "sz": quantity,
+            "limit_px": tp_price,
+            "order_type": {"trigger": {"triggerPx": tp_price, "isMarket": True, "tpsl": "tp"}},
+            "reduce_only": True,
+        }
+        sl_order = {
+            "coin": coin, "is_buy": is_close, "sz": quantity,
+            "limit_px": sl_price,
+            "order_type": {"trigger": {"triggerPx": sl_price, "isMarket": True, "tpsl": "sl"}},
+            "reduce_only": True,
+        }
+
+        logger.info(
+            f"[LIVE] Submitting grouped {side_label}: entry={price} TP={tp_price} SL={sl_price} sz={quantity}"
+        )
+        result = self.exchange.bulk_orders(
+            [entry_order, tp_order, sl_order], grouping="normalTpsl",
+        )
+        logger.debug(f"[LIVE] Grouped order raw response: {result}")
+
+        parsed = self._parse_limit_result(result, price, quantity)
+        logger.info(
+            f"[LIVE] Grouped {side_label} @ {price}: oid={parsed['oid']} status={parsed['status']} "
+            f"TP={tp_price} SL={sl_price}"
+        )
+        return {
+            "id": str(result), "oid": parsed["oid"],
+            "symbol": coin, "side": side_label, "type": "limit",
             "amount": parsed["fill_sz"], "price": parsed["fill_price"],
             "cost": amount_quote, "status": parsed["status"],
             "paper": False, "raw": result,
