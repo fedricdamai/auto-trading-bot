@@ -3,8 +3,8 @@
 
 Hyperliquid defaults to Trader V2:
 reaction-based 30m/1h support and resistance, trend as context, structural
-TP/SL, strict one-family-per-symbol execution, and a repair-only live-position
-watchdog. Set TRADER_VERSION=v1 for deliberate rollback.
+TP/SL, strict one-family-per-symbol execution, repair-only protection, and
+persistent trade lifecycle IDs. Set TRADER_VERSION=v1 for deliberate rollback.
 """
 
 import logging
@@ -57,8 +57,6 @@ def setup_logging(level: str):
         handlers=[console, file_handler],
     )
 
-    # Third-party polling libraries are extremely chatty at INFO. Keep them at
-    # warning level globally. This does not hide bot strategy INFO messages.
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
 
@@ -72,11 +70,10 @@ def build_exchange(config: Config):
 
 
 def build_trader(config: Config, exchange, notifier=None):
-    # Production V2 uses grouped entry families plus an exchange-authoritative
-    # repair-only watchdog. Protection placement failures NEVER auto-flatten a
-    # live position; they block new entries for that symbol and retry TP/SL.
+    # Production V2 keeps the repair-only execution policy and adds one stable
+    # audit ID across trigger, order, fill, protection and final result.
     if config.exchange_backend == "hyperliquid" and config.trader_version == "v2":
-        from bot.trader_v2_repairing import Trader
+        from bot.trader_v2_tracked import Trader
         return Trader(config, exchange, notifier)
 
     from bot.trader import Trader
@@ -84,9 +81,9 @@ def build_trader(config: Config, exchange, notifier=None):
 
 
 def build_telegram_bot(config: Config):
-    """Use exchange-sourced emergency controls with Hyperliquid Trader V2."""
+    """Use exchange-sourced controls and trade-ID notifications for V2."""
     if config.exchange_backend == "hyperliquid" and config.trader_version == "v2":
-        from bot.telegram_notifier_v2 import TelegramBot
+        from bot.telegram_notifier_tracked import TelegramBot
     else:
         from bot.telegram_notifier import TelegramBot
     return TelegramBot(config.tg_bot_token, config.tg_chat_id, config.telegram_whitelist)
@@ -124,6 +121,7 @@ def main():
             logger.info("  Strategy:    reaction S/R first, HTF trend as context")
             logger.info("  Orders:      one grouped entry + reduce-only TP/SL per symbol")
             logger.info("  Protection:  repair-only watchdog, never auto-flatten")
+            logger.info("  Tracking:    persistent trade ID + lifecycle event journal")
             logger.info(f"  Leverage:    fixed {config.v2_leverage}x isolated")
             logger.info(f"  Risk/trade:  ${config.v2_risk_per_trade_usd:.2f}")
             logger.info(f"  Max notional:${config.v2_max_position_notional_usd:.2f}")
@@ -162,8 +160,6 @@ def main():
         tg_bot.start_command_listener()
         logger.info("Telegram commands active: /logs to control log streaming")
 
-        # Proactive startup acknowledgement. V2 overrides this method with a
-        # strategy-specific message; V1 keeps its legacy startup format.
         if config.exchange_backend == "hyperliquid" and config.trader_version == "v2":
             tg_bot.notify_startup(
                 symbol,
