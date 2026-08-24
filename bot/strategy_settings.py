@@ -18,10 +18,11 @@ class StrategySettings:
     symbols: tuple[str, ...] = ("BTC", "ETH", "SOL", "HYPE", "BNB")
     max_positions: int = 5
 
-    # Exchange state is managed every 5 seconds. Historical trade setups are
-    # re-evaluated every 60 seconds. This is intentionally independent from the
+    # Exchange state is managed every 1 second so a newly-filled entry is
+    # detected and protected quickly. Historical trade setups are still
+    # re-evaluated only every 60 seconds. This cadence is independent from the
     # 30m/1h/4h candle timeframes used by the strategy itself.
-    check_interval_seconds: int = 5
+    check_interval_seconds: int = 1
     signal_scan_interval_seconds: int = 60
 
     # Telegram heartbeat is intentionally much slower than the market scan so
