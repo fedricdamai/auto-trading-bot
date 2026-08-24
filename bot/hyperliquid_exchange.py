@@ -80,9 +80,9 @@ class HyperliquidExchange:
             self.exchange.update_leverage(
                 leverage=self.config.hl_leverage,
                 name=self.config.hl_symbol,
-                is_cross=True,
+                is_cross=False,
             )
-            logger.info(f"Leverage set to {self.config.hl_leverage}x on {self.config.hl_symbol}")
+            logger.info(f"Leverage set to {self.config.hl_leverage}x ISOLATED on {self.config.hl_symbol}")
         except Exception as e:
             logger.error(f"Failed to set leverage: {e}")
 
