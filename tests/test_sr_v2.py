@@ -1,8 +1,14 @@
 import pandas as pd
+import pytest
 
 from bot.config import Config
 from bot.levels import Level
-from bot.sr_v2 import detect_timeframe_levels, merge_timeframe_levels
+from bot.sr_v2 import (
+    SR_BY_TIMEFRAME,
+    _pivot_candidates,
+    detect_timeframe_levels,
+    merge_timeframe_levels,
+)
 from bot.strategy_v2 import Regime, _pick_trade_level, _take_profit
 
 
@@ -36,6 +42,45 @@ def _oscillating_df(timeframe="30m", periods=200):
     return pd.DataFrame(rows)
 
 
+def _new_pivot_df(timeframe: str, right_candles: int, kind: str) -> pd.DataFrame:
+    """Build a fresh pivot at index 8 with only N candles closed to its right."""
+    step = pd.Timedelta(minutes=30) if timeframe == "30m" else pd.Timedelta(hours=1)
+    pivot_idx = 8
+    periods = pivot_idx + 1 + right_candles
+    rows = []
+    start = pd.Timestamp("2026-02-01")
+
+    for i in range(periods):
+        # Normal candles stay well away from the prospective pivot extreme.
+        o = 100.0
+        c = 100.2
+        high = 101.0
+        low = 99.0
+
+        if i == pivot_idx:
+            if kind == "support":
+                low = 90.0
+                o = 96.0
+                c = 97.0
+                high = 101.0
+            else:
+                high = 110.0
+                o = 104.0
+                c = 103.0
+                low = 99.0
+
+        rows.append({
+            "timestamp": start + step * i,
+            "open": o,
+            "high": high,
+            "low": low,
+            "close": c,
+            "volume": 100.0,
+        })
+
+    return pd.DataFrame(rows)
+
+
 def test_timeframe_reactions_define_support_and_resistance():
     levels = detect_timeframe_levels(_oscillating_df("30m"), "30m")
 
@@ -46,6 +91,31 @@ def test_timeframe_reactions_define_support_and_resistance():
     assert resistances
     assert any(abs(lv.price - 99.5) < 0.5 and lv.touches >= 3 for lv in supports)
     assert any(abs(lv.price - 110.5) < 0.5 and lv.touches >= 3 for lv in resistances)
+
+
+@pytest.mark.parametrize("timeframe", ["30m", "1h"])
+@pytest.mark.parametrize("kind", ["support", "resistance"])
+def test_new_pivot_requires_all_three_right_candles(timeframe, kind):
+    """A fresh high/low is not a confirmed pivot until +1, +2 and +3 close."""
+    params = SR_BY_TIMEFRAME[timeframe]
+    assert params.pivot_left == 3
+    assert params.pivot_right == 3
+
+    pivot_idx = 8
+
+    only_two_right = _new_pivot_df(timeframe, right_candles=2, kind=kind)
+    candidates_before_confirmation = _pivot_candidates(only_two_right, params)
+    assert not any(
+        c["idx"] == pivot_idx and c["kind"] == kind
+        for c in candidates_before_confirmation
+    )
+
+    three_right = _new_pivot_df(timeframe, right_candles=3, kind=kind)
+    candidates_after_confirmation = _pivot_candidates(three_right, params)
+    assert any(
+        c["idx"] == pivot_idx and c["kind"] == kind
+        for c in candidates_after_confirmation
+    )
 
 
 def test_level_type_is_not_relabelled_from_current_price():
