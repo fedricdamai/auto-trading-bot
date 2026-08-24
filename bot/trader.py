@@ -4,8 +4,8 @@ from dataclasses import dataclass
 
 from bot.config import Config
 from bot.levels import (
-    detect_levels, detect_levels_multi_tf, compute_tp_sl, detect_doji,
-    compute_trend_bias, check_breakout_fakeout,
+    detect_levels, detect_levels_multi_tf, compute_tp_sl_from_levels,
+    detect_doji, compute_trend_bias, check_breakout_fakeout,
     Level, DojiSignal, TrendBias, BreakoutCheck,
 )
 from bot.telegram_notifier import TelegramNotifier
@@ -54,6 +54,10 @@ class OpenPosition:
     filled_at: float = 0.0
     doji_entry: bool = False
     leverage: int = 10
+    # TP/SL prices last confirmed on the exchange, so trailing jitter
+    # doesn't churn cancel/re-place cycles every tick
+    last_synced_sl: float = 0.0
+    last_synced_tp: float = 0.0
 
 
 class Trader:
@@ -182,12 +186,13 @@ class Trader:
             entry = pos_data["entry_price"]
             side = pos_data["side"]
             kind = "support" if side == "long" else "resistance"
-            tpsl = compute_tp_sl(
-                entry, self.config.hl_leverage,
-                self.config.target_pnl_pct, self.config.max_loss_pct, side,
-            )
             self.exchange.switch_symbol(sym)
             price = self.exchange.get_ticker_price()
+            try:
+                self._refresh_levels_for(sym, price)
+            except Exception as e:
+                logger.warning(f"[{sym}] Level refresh during sync failed: {e}")
+            tpsl = self._compute_tp_sl(sym, entry, side, self.config.hl_leverage)
             self.positions[sym] = OpenPosition(
                 symbol=sym,
                 entry_price=entry,
@@ -212,20 +217,37 @@ class Trader:
 
             if hasattr(self.exchange, 'get_trigger_orders_for_symbol'):
                 existing_triggers = self.exchange.get_trigger_orders_for_symbol(sym)
+                if len(existing_triggers) > 2:
+                    # duplicates accumulated by earlier runs — wipe and re-place a clean pair
+                    cancelled = self.exchange.cancel_trigger_orders_for_symbol(sym)
+                    logger.info(f"[{sym}] Startup cleanup: cancelled {cancelled} duplicate TP/SL triggers")
+                    existing_triggers = self.exchange.get_trigger_orders_for_symbol(sym)
                 if not existing_triggers:
                     try:
                         self.exchange.place_tp_sl_orders(
                             pos_data["size"], side, tpsl["tp_price"], tpsl["sl_price"],
                         )
+                        pos = self.positions[sym]
+                        pos.last_synced_sl = tpsl["sl_price"]
+                        pos.last_synced_tp = tpsl["tp_price"]
                         logger.info(f"[{sym}] TP/SL triggers placed for synced position")
                     except Exception as e:
                         logger.error(f"[{sym}] Failed to place TP/SL for synced position: {e}")
                 else:
+                    pos = self.positions[sym]
+                    pos.last_synced_sl = tpsl["sl_price"]
+                    pos.last_synced_tp = tpsl["tp_price"]
                     logger.info(f"[{sym}] {len(existing_triggers)} trigger orders already exist")
 
         for sym in self._get_symbols():
             if sym in self.positions:
                 continue
+            if hasattr(self.exchange, 'get_trigger_orders_for_symbol'):
+                orphans = self.exchange.get_trigger_orders_for_symbol(sym)
+                if orphans:
+                    # reduce-only TP/SL triggers with no position behind them
+                    cancelled = self.exchange.cancel_trigger_orders_for_symbol(sym)
+                    logger.info(f"[{sym}] Cancelled {cancelled} orphaned TP/SL triggers (no open position)")
             orders = self.exchange.get_open_orders_for_symbol(sym)
             if not orders:
                 continue
@@ -240,10 +262,7 @@ class Trader:
             side = "long" if side_raw == "B" else "short"
             kind = "support" if side == "long" else "resistance"
             qty = float(o.get("sz", 0))
-            tpsl = compute_tp_sl(
-                price, self.config.hl_leverage,
-                self.config.target_pnl_pct, self.config.max_loss_pct, side,
-            )
+            tpsl = self._compute_tp_sl(sym, price, side, self.config.hl_leverage, level_price=price)
             self.pending_orders[sym] = PendingOrder(
                 symbol=sym,
                 oid=o.get("oid"),
@@ -262,6 +281,21 @@ class Trader:
             )
             logger.info(f"Synced {sym} pending order: {side} @ {price}")
 
+    # ── TP/SL computation ────────────────────────────────────────────
+
+    def _compute_tp_sl(self, symbol: str, entry: float, side: str,
+                       leverage: int, level_price: float | None = None) -> dict:
+        """S/R-zone-aware TP/SL for a symbol, falling back to percent targets."""
+        sym_levels = list(self.known_levels.get(symbol, {}).values())
+        return compute_tp_sl_from_levels(
+            entry, side, sym_levels, leverage,
+            self.config.target_pnl_pct, self.config.max_loss_pct,
+            level_price=level_price,
+            sl_zone_buffer_pct=self.config.sl_zone_buffer_pct,
+            tp_zone_buffer_pct=self.config.tp_zone_buffer_pct,
+            min_rr=self.config.min_risk_reward,
+        )
+
     # ── Level detection ──────────────────────────────────────────────
 
     def _refresh_levels_for(self, symbol: str, current_price: float):
@@ -274,7 +308,9 @@ class Trader:
         except Exception as e:
             logger.warning(f"Multi-TF detection failed for {symbol}, falling back: {e}")
             try:
-                df = self.exchange.fetch_ohlcv()
+                # fall back to the 1h chart — the day-trader S/R timeframe —
+                # rather than the noisy 5m scalping feed
+                df = self.exchange.fetch_ohlcv(timeframe="1h", lookback=500)
                 levels = detect_levels(
                     df,
                     tolerance_pct=self.config.level_tolerance_pct,
@@ -540,11 +576,7 @@ class Trader:
         side = "long" if level.kind == "support" else "short"
         entry_price = level.price
 
-        tpsl = compute_tp_sl(
-            entry_price, leverage,
-            self.config.target_pnl_pct, self.config.max_loss_pct,
-            side=side,
-        )
+        tpsl = self._compute_tp_sl(symbol, entry_price, side, leverage, level_price=level.price)
 
         try:
             if side == "long":
@@ -584,8 +616,9 @@ class Trader:
             fib_tag = f" Fib{level.fib_ratio}" if level.fib_ratio else ""
             logger.info(
                 f"[{symbol}] LIMIT {side.upper()} at {level.kind.upper()} {level.price:.2f}{fib_tag} | "
-                f"Size: {order['amount']} | SL: {tpsl['sl_price']:.2f} | "
-                f"TP: {tpsl['tp_price']:.2f} | Str: {effective_strength:.1f}"
+                f"Size: {order['amount']} | SL: {tpsl['sl_price']:.2f} ({tpsl.get('sl_basis', '?')}) | "
+                f"TP: {tpsl['tp_price']:.2f} ({tpsl.get('tp_basis', '?')}) | "
+                f"R:R {tpsl.get('risk_reward', 0):.1f} | Str: {effective_strength:.1f}"
             )
 
             if self.notifier:
@@ -669,6 +702,8 @@ class Trader:
             filled_at=time.time(),
             doji_entry=self.last_doji_signal is not None,
             leverage=self.config.hl_leverage,
+            last_synced_sl=tpsl["sl_price"],
+            last_synced_tp=tpsl["tp_price"],
         )
 
         logger.info(
@@ -758,14 +793,18 @@ class Trader:
         levels_sorted = sorted(levels.values(), key=lambda l: l.price)
         old_sl = pos.stop_loss
         old_tp = pos.take_profit
+        sl_buf = 1 - self.config.sl_zone_buffer_pct / 100
+        tp_buf = 1 - self.config.tp_zone_buffer_pct / 100
+        # level means drift a little on every refresh; ignore sub-jitter moves
+        min_step = pos.entry_price * 0.0005
 
         supports_below = [l for l in levels_sorted if l.kind == "support" and l.price < current_price]
         resistances_above = [l for l in levels_sorted if l.kind == "resistance" and l.price > current_price]
 
         if supports_below:
             nearest_support = supports_below[-1].price
-            new_sl = round(nearest_support * 0.998, 2)
-            if new_sl > pos.stop_loss:
+            new_sl = round(nearest_support * sl_buf, 2)
+            if new_sl > pos.stop_loss + min_step:
                 pos.stop_loss = new_sl
 
         profit_pct = (current_price - pos.entry_price) / pos.entry_price * 100 * leverage
@@ -774,8 +813,9 @@ class Trader:
 
         if resistances_above and current_price >= pos.initial_tp * 0.995:
             next_resistance = resistances_above[0].price
-            if next_resistance > pos.take_profit:
-                pos.take_profit = round(next_resistance * 0.998, 2)
+            new_tp = round(next_resistance * tp_buf, 2)
+            if new_tp > pos.take_profit + min_step:
+                pos.take_profit = new_tp
 
         if (pos.stop_loss != old_sl or pos.take_profit != old_tp):
             self._sync_tp_sl_to_exchange(pos)
@@ -788,14 +828,17 @@ class Trader:
         levels_sorted = sorted(levels.values(), key=lambda l: l.price)
         old_sl = pos.stop_loss
         old_tp = pos.take_profit
+        sl_buf = 1 + self.config.sl_zone_buffer_pct / 100
+        tp_buf = 1 + self.config.tp_zone_buffer_pct / 100
+        min_step = pos.entry_price * 0.0005
 
         resistances_above = [l for l in levels_sorted if l.kind == "resistance" and l.price > current_price]
         supports_below = [l for l in levels_sorted if l.kind == "support" and l.price < current_price]
 
         if resistances_above:
             nearest_resistance = resistances_above[0].price
-            new_sl = round(nearest_resistance * 1.002, 2)
-            if new_sl < pos.stop_loss:
+            new_sl = round(nearest_resistance * sl_buf, 2)
+            if new_sl < pos.stop_loss - min_step:
                 pos.stop_loss = new_sl
 
         profit_pct = (pos.entry_price - current_price) / pos.entry_price * 100 * leverage
@@ -804,23 +847,46 @@ class Trader:
 
         if supports_below and current_price <= pos.initial_tp * 1.005:
             next_support = supports_below[-1].price
-            if next_support < pos.take_profit:
-                pos.take_profit = round(next_support * 1.002, 2)
+            new_tp = round(next_support * tp_buf, 2)
+            if new_tp < pos.take_profit - min_step:
+                pos.take_profit = new_tp
 
         if (pos.stop_loss != old_sl or pos.take_profit != old_tp):
             self._sync_tp_sl_to_exchange(pos)
 
     def _sync_tp_sl_to_exchange(self, pos: OpenPosition):
-        """Update TP/SL trigger orders on the exchange after trailing."""
+        """Update TP/SL trigger orders on the exchange after trailing.
+
+        Skips the round-trip unless a price actually moved beyond the
+        configured threshold since the last confirmed sync — cancel/re-place
+        on every tick is what floods the order book with duplicates.
+        """
         if self.config.paper_trade:
             return
         if not hasattr(self.exchange, 'update_tp_sl_orders'):
             return
+
+        threshold = self.config.tp_sl_sync_min_change_pct / 100
+
+        def _changed(new: float, last: float) -> bool:
+            return last <= 0 or abs(new - last) / last >= threshold
+
+        if not (_changed(pos.stop_loss, pos.last_synced_sl)
+                or _changed(pos.take_profit, pos.last_synced_tp)):
+            return
+
         try:
             self.exchange.switch_symbol(pos.symbol)
-            self.exchange.update_tp_sl_orders(
+            result = self.exchange.update_tp_sl_orders(
                 pos.quantity, pos.side, pos.take_profit, pos.stop_loss,
             )
+            if isinstance(result, dict) and any(
+                k in result for k in ("error", "tp_error", "sl_error")
+            ):
+                logger.warning(f"[{pos.symbol}] TP/SL sync incomplete, will retry: {result}")
+                return
+            pos.last_synced_sl = pos.stop_loss
+            pos.last_synced_tp = pos.take_profit
             logger.info(
                 f"[{pos.symbol}] TP/SL triggers updated: "
                 f"TP={pos.take_profit:.2f} SL={pos.stop_loss:.2f}"

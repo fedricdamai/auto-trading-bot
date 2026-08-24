@@ -45,6 +45,16 @@ class Config:
     paper_trade: bool = os.getenv("PAPER_TRADE", "true").lower() == "true"
     log_level: str = os.getenv("LOG_LEVEL", "INFO")
 
+    # TP/SL positioning around S/R zones
+    # SL sits this % beyond the level that justifies the trade (zone buffer)
+    sl_zone_buffer_pct: float = float(os.getenv("SL_ZONE_BUFFER_PCT", "0.25"))
+    # TP sits this % in front of the next opposing level
+    tp_zone_buffer_pct: float = float(os.getenv("TP_ZONE_BUFFER_PCT", "0.15"))
+    # Minimum reward-to-risk before a nearer level is skipped for a further one
+    min_risk_reward: float = float(os.getenv("MIN_RISK_REWARD", "1.5"))
+    # Only re-place exchange TP/SL triggers when a price moved at least this %
+    tp_sl_sync_min_change_pct: float = float(os.getenv("TP_SL_SYNC_MIN_CHANGE_PCT", "0.1"))
+
     # Limit order settings
     order_ttl_hours: float = float(os.getenv("ORDER_TTL_HOURS", "2"))
     level_refresh_seconds: int = int(os.getenv("LEVEL_REFRESH_SECONDS", "300"))

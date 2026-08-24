@@ -42,7 +42,7 @@ class BreakoutCheck:
     details: str = ""
 
 
-TF_WEIGHTS = {"1d": 1.5, "4h": 1.0, "1h": 0.6, "5m": 0.3}
+TF_WEIGHTS = {"1d": 1.5, "4h": 1.2, "1h": 0.8, "15m": 0.5}
 
 FIB_RATIOS = {
     0.236: 30,
@@ -52,12 +52,17 @@ FIB_RATIOS = {
     0.786: 38,
 }
 
+# S/R levels are drawn on day-trader (15m/1h) and swing-trader (4h/1d)
+# timeframes; 5m is too noisy to anchor TP/SL against.
 MULTI_TF_CONFIGS = [
     {"timeframe": "1d", "lookback": 120},
     {"timeframe": "4h", "lookback": 200},
     {"timeframe": "1h", "lookback": 500},
-    {"timeframe": "5m", "lookback": 500},
+    {"timeframe": "15m", "lookback": 500},
 ]
+
+# Timeframes considered reliable enough to anchor TP/SL placement.
+DAY_SWING_TFS = {"15m", "1h", "4h", "1d"}
 
 
 def _ema(values: np.ndarray, period: int) -> np.ndarray:
@@ -313,7 +318,15 @@ def detect_levels_multi_tf(
     if not all_raw_levels:
         return []
 
-    return _merge_multi_tf_levels(all_raw_levels, tolerance_pct)
+    merged = _merge_multi_tf_levels(all_raw_levels, tolerance_pct)
+
+    current_price = None
+    try:
+        current_price = float(exchange.get_ticker_price())
+    except Exception:
+        pass
+
+    return _finalize_levels(merged, tolerance_pct, current_price)
 
 
 def detect_doji(df: pd.DataFrame, lookback: int = 5) -> DojiSignal | None:
@@ -529,6 +542,48 @@ def _merge_multi_tf_levels(
     return result
 
 
+def _finalize_levels(
+    levels: list[Level], tolerance_pct: float, current_price: float | None,
+) -> list[Level]:
+    """Collapse near-duplicate levels and relabel kind against live price.
+
+    Group means drift during merging, so two groups can end up within
+    tolerance of each other (e.g. 98.87 and 98.89); keep only the stronger.
+    Kind is recomputed against the current price because a level detected as
+    resistance on a stale candle may already sit below the market.
+    """
+    deduped = _dedupe_levels(levels, tolerance_pct)
+
+    if current_price is not None and current_price > 0:
+        for lv in deduped:
+            lv.kind = "support" if lv.price < current_price else "resistance"
+
+    deduped.sort(key=lambda l: l.strength, reverse=True)
+    return deduped
+
+
+def _dedupe_levels(levels: list[Level], tolerance_pct: float) -> list[Level]:
+    tolerance = tolerance_pct / 100.0
+    kept: list[Level] = []
+
+    for lv in sorted(levels, key=lambda l: l.strength, reverse=True):
+        duplicate = None
+        for existing in kept:
+            if abs(lv.price - existing.price) / existing.price <= tolerance:
+                duplicate = existing
+                break
+        if duplicate is None:
+            kept.append(lv)
+        else:
+            duplicate.touches += lv.touches
+            merged_tfs = set(duplicate.timeframes or []) | set(lv.timeframes or [])
+            duplicate.timeframes = sorted(merged_tfs) if merged_tfs else duplicate.timeframes
+            if duplicate.fib_ratio is None:
+                duplicate.fib_ratio = lv.fib_ratio
+
+    return kept
+
+
 def _find_swing_points(
     highs: np.ndarray, lows: np.ndarray, closes: np.ndarray, window: int,
 ) -> list[float]:
@@ -646,6 +701,137 @@ def compute_tp_sl(
         "tp_move_pct": round(tp_move, 4),
         "sl_move_pct": round(sl_move, 4),
         "liq_price": round(liq_price, 2),
+    }
+
+
+def _levels_for_tp_sl(levels: list[Level]) -> list[Level]:
+    """Keep only levels confirmed on day-trader (15m/1h) or swing-trader (4h/1d) timeframes."""
+    out = []
+    for lv in levels:
+        tfs = set(lv.timeframes or [])
+        if not tfs or tfs & DAY_SWING_TFS:
+            out.append(lv)
+    return out
+
+
+def compute_tp_sl_from_levels(
+    entry: float,
+    side: str,
+    levels: list[Level],
+    leverage: int,
+    target_pnl_pct: float,
+    max_loss_pct: float,
+    level_price: float | None = None,
+    sl_zone_buffer_pct: float = 0.25,
+    tp_zone_buffer_pct: float = 0.15,
+    min_rr: float = 1.5,
+    max_tp_distance_pct: float = 5.0,
+) -> dict:
+    """Position TP/SL around support/resistance zones instead of raw percents.
+
+    Longs: SL just below the support the trade is based on (a break of the
+    zone invalidates the setup), TP just in front of the next resistance so
+    the order fills before the zone can reject price. Shorts mirror this.
+    S/R behaves as a zone, not an exact price, hence the buffers. The
+    percent-based stop from compute_tp_sl still caps the maximum risk (and
+    keeps clear of liquidation); if the nearest opposing level gives less
+    than min_rr reward-to-risk, further levels within max_tp_distance_pct
+    are considered before falling back to the percent target.
+    """
+    pct = compute_tp_sl(entry, leverage, target_pnl_pct, max_loss_pct, side=side)
+    usable = _levels_for_tp_sl(levels or [])
+    sl_buf = sl_zone_buffer_pct / 100.0
+    tp_buf = tp_zone_buffer_pct / 100.0
+
+    sl_price = pct["sl_price"]
+    tp_price = pct["tp_price"]
+    sl_basis = "percent"
+    tp_basis = "percent"
+
+    if side == "long":
+        supports = sorted(
+            (l.price for l in usable if l.kind == "support" and l.price < entry),
+            reverse=True,
+        )
+        opposing = sorted(l.price for l in usable if l.kind == "resistance" and l.price > entry)
+
+        anchor = level_price if level_price is not None and level_price <= entry else (
+            supports[0] if supports else None
+        )
+        if anchor is not None:
+            cand = round(anchor * (1 - sl_buf), 2)
+            if pct["sl_price"] <= cand < entry:
+                sl_price = cand
+                sl_basis = "level"
+
+        risk = entry - sl_price
+        if risk > 0:
+            chosen = None
+            for lv_price in opposing:
+                cand = round(lv_price * (1 - tp_buf), 2)
+                if cand <= entry:
+                    continue
+                if (cand - entry) / entry * 100 > max_tp_distance_pct:
+                    break
+                if (cand - entry) / risk >= min_rr:
+                    chosen = cand
+                    break
+            if chosen is not None:
+                tp_price = chosen
+                tp_basis = "level"
+            elif opposing:
+                front = round(opposing[0] * (1 - tp_buf), 2)
+                if entry < front < tp_price:
+                    tp_price = front
+                    tp_basis = "level_capped"
+    else:
+        resistances = sorted(l.price for l in usable if l.kind == "resistance" and l.price > entry)
+        opposing = sorted(
+            (l.price for l in usable if l.kind == "support" and l.price < entry),
+            reverse=True,
+        )
+
+        anchor = level_price if level_price is not None and level_price >= entry else (
+            resistances[0] if resistances else None
+        )
+        if anchor is not None:
+            cand = round(anchor * (1 + sl_buf), 2)
+            if entry < cand <= pct["sl_price"]:
+                sl_price = cand
+                sl_basis = "level"
+
+        risk = sl_price - entry
+        if risk > 0:
+            chosen = None
+            for lv_price in opposing:
+                cand = round(lv_price * (1 + tp_buf), 2)
+                if cand >= entry:
+                    continue
+                if (entry - cand) / entry * 100 > max_tp_distance_pct:
+                    break
+                if (entry - cand) / risk >= min_rr:
+                    chosen = cand
+                    break
+            if chosen is not None:
+                tp_price = chosen
+                tp_basis = "level"
+            elif opposing:
+                front = round(opposing[0] * (1 + tp_buf), 2)
+                if tp_price < front < entry:
+                    tp_price = front
+                    tp_basis = "level_capped"
+
+    risk_abs = abs(entry - sl_price)
+    reward_abs = abs(tp_price - entry)
+    return {
+        "tp_price": tp_price,
+        "sl_price": sl_price,
+        "tp_move_pct": round(reward_abs / entry * 100, 4),
+        "sl_move_pct": round(risk_abs / entry * 100, 4),
+        "liq_price": pct["liq_price"],
+        "risk_reward": round(reward_abs / risk_abs, 2) if risk_abs > 0 else 0.0,
+        "tp_basis": tp_basis,
+        "sl_basis": sl_basis,
     }
 
 

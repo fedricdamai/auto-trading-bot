@@ -5,7 +5,16 @@ import pytest
 from bot.levels import (
     detect_levels, _find_swing_points,
     _cluster_levels, _analyze_level, compute_tp_sl, detect_doji,
+    compute_tp_sl_from_levels, _dedupe_levels, _finalize_levels, Level,
 )
+
+
+def _level(price, kind, strength=50, touches=3, timeframes=None):
+    return Level(
+        price=price, kind=kind, touches=touches, strength=strength,
+        volume_avg=100, last_touch_idx=10,
+        timeframes=timeframes if timeframes is not None else ["1h"],
+    )
 
 
 def _make_candles(prices: list[float], volumes: list[float] | None = None) -> pd.DataFrame:
@@ -121,6 +130,130 @@ class TestComputeTpSl:
         r_default = compute_tp_sl(entry=100000, leverage=3, target_pnl_pct=1.0, max_loss_pct=1.0)
         r_long = compute_tp_sl(entry=100000, leverage=3, target_pnl_pct=1.0, max_loss_pct=1.0, side="long")
         assert r_default == r_long
+
+
+class TestComputeTpSlFromLevels:
+    def test_long_sl_below_support_tp_before_resistance(self):
+        levels = [
+            _level(100.0, "support", timeframes=["1h", "4h"]),
+            _level(102.0, "resistance", timeframes=["4h"]),
+        ]
+        r = compute_tp_sl_from_levels(
+            entry=100.0, side="long", levels=levels, leverage=5,
+            target_pnl_pct=2.5, max_loss_pct=1.5, level_price=100.0,
+        )
+        assert r["sl_basis"] == "level"
+        assert r["sl_price"] == pytest.approx(99.75, abs=0.01)  # 0.25% below support
+        assert r["tp_basis"] == "level"
+        assert 100.0 < r["tp_price"] < 102.0                    # in front of resistance
+        assert r["tp_price"] == pytest.approx(101.85, abs=0.01)
+        assert r["risk_reward"] >= 1.5
+
+    def test_short_sl_above_resistance_tp_before_support(self):
+        levels = [
+            _level(100.0, "resistance", timeframes=["1h", "4h"]),
+            _level(98.0, "support", timeframes=["1d"]),
+        ]
+        r = compute_tp_sl_from_levels(
+            entry=100.0, side="short", levels=levels, leverage=5,
+            target_pnl_pct=2.5, max_loss_pct=1.5, level_price=100.0,
+        )
+        assert r["sl_basis"] == "level"
+        assert r["sl_price"] == pytest.approx(100.25, abs=0.01)
+        assert r["tp_basis"] == "level"
+        assert 98.0 < r["tp_price"] < 100.0
+        assert r["risk_reward"] >= 1.5
+
+    def test_skips_too_close_resistance_for_min_rr(self):
+        levels = [
+            _level(100.0, "support"),
+            _level(100.2, "resistance"),   # too close: reward < min_rr * risk
+            _level(103.0, "resistance"),
+        ]
+        r = compute_tp_sl_from_levels(
+            entry=100.0, side="long", levels=levels, leverage=5,
+            target_pnl_pct=2.5, max_loss_pct=1.5, level_price=100.0,
+        )
+        assert r["tp_basis"] == "level"
+        assert r["tp_price"] > 102.0       # anchored to 103, not 100.2
+
+    def test_caps_percent_tp_at_nearest_resistance(self):
+        levels = [
+            _level(100.0, "support"),
+            _level(100.3, "resistance"),   # inside the percent target's path
+        ]
+        r = compute_tp_sl_from_levels(
+            entry=100.0, side="long", levels=levels, leverage=5,
+            target_pnl_pct=2.5, max_loss_pct=1.5, level_price=100.0,
+        )
+        pct = compute_tp_sl(100.0, 5, 2.5, 1.5, side="long")
+        assert r["tp_basis"] == "level_capped"
+        assert r["tp_price"] < pct["tp_price"]
+        assert r["tp_price"] < 100.3
+
+    def test_falls_back_to_percent_without_levels(self):
+        r = compute_tp_sl_from_levels(
+            entry=100.0, side="long", levels=[], leverage=5,
+            target_pnl_pct=2.5, max_loss_pct=1.5,
+        )
+        pct = compute_tp_sl(100.0, 5, 2.5, 1.5, side="long")
+        assert r["tp_price"] == pct["tp_price"]
+        assert r["sl_price"] == pct["sl_price"]
+        assert r["tp_basis"] == "percent"
+        assert r["sl_basis"] == "percent"
+
+    def test_percent_stop_caps_risk_when_support_too_far(self):
+        levels = [_level(95.0, "support")]
+        r = compute_tp_sl_from_levels(
+            entry=100.0, side="long", levels=levels, leverage=5,
+            target_pnl_pct=2.5, max_loss_pct=1.5, level_price=95.0,
+        )
+        pct = compute_tp_sl(100.0, 5, 2.5, 1.5, side="long")
+        assert r["sl_basis"] == "percent"
+        assert r["sl_price"] == pct["sl_price"]
+
+    def test_ignores_5m_only_levels(self):
+        levels = [
+            _level(100.0, "support", timeframes=["1h"]),
+            _level(100.3, "resistance", timeframes=["5m"]),  # noise level
+            _level(102.0, "resistance", timeframes=["4h"]),
+        ]
+        r = compute_tp_sl_from_levels(
+            entry=100.0, side="long", levels=levels, leverage=5,
+            target_pnl_pct=2.5, max_loss_pct=1.5, level_price=100.0,
+        )
+        assert r["tp_price"] > 101.0       # anchored to the 4h level, not 5m noise
+
+
+class TestDedupeLevels:
+    def test_merges_near_duplicate_levels(self):
+        levels = [
+            _level(98.87, "resistance", strength=80, touches=4, timeframes=["1h"]),
+            _level(98.89, "resistance", strength=60, touches=3, timeframes=["4h"]),
+        ]
+        result = _dedupe_levels(levels, tolerance_pct=0.5)
+        assert len(result) == 1
+        assert result[0].price == 98.87        # stronger level wins
+        assert result[0].touches == 7
+        assert result[0].timeframes == ["1h", "4h"]
+
+    def test_keeps_distinct_levels(self):
+        levels = [
+            _level(98.0, "support"),
+            _level(102.0, "resistance"),
+        ]
+        result = _dedupe_levels(levels, tolerance_pct=0.5)
+        assert len(result) == 2
+
+    def test_finalize_relabels_kind_against_current_price(self):
+        levels = [
+            _level(99.0, "resistance"),   # stale: price has moved above it
+            _level(101.0, "support"),     # stale: price has moved below it
+        ]
+        result = _finalize_levels(levels, tolerance_pct=0.5, current_price=100.0)
+        by_price = {l.price: l for l in result}
+        assert by_price[99.0].kind == "support"
+        assert by_price[101.0].kind == "resistance"
 
 
 class TestDetectDoji:

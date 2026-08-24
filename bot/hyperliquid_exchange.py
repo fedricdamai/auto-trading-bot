@@ -12,6 +12,11 @@ from bot.config import Config
 
 logger = logging.getLogger(__name__)
 
+# orderType values that frontend_open_orders reports for trigger (TP/SL) orders.
+TRIGGER_ORDER_TYPES = {
+    "Stop Market", "Stop Limit", "Take Profit Market", "Take Profit Limit",
+}
+
 
 class HyperliquidExchange:
     """Hyperliquid perpetual futures exchange adapter."""
@@ -121,16 +126,21 @@ class HyperliquidExchange:
     def get_account_state(self) -> dict:
         return self.info.user_state(self.address)
 
+    @staticmethod
+    def _is_trigger_order(order: dict) -> bool:
+        """True for TP/SL trigger orders as reported by frontend_open_orders."""
+        if order.get("isTrigger"):
+            return True
+        order_type = order.get("orderType", "")
+        return (
+            order_type in TRIGGER_ORDER_TYPES
+            or order_type.startswith("Stop")
+            or order_type.startswith("Take Profit")
+        )
+
     def get_open_orders(self) -> list[dict]:
         """Return open limit orders (non-trigger) for the configured symbol."""
-        if self.config.paper_trade:
-            return []
-        try:
-            orders = self.info.open_orders(self.address)
-            return [o for o in orders if o.get("coin") == self.config.hl_symbol]
-        except Exception as e:
-            logger.error(f"Failed to get open orders: {e}")
-            return []
+        return self.get_open_orders_for_symbol(self.config.hl_symbol)
 
     def get_all_open_orders(self) -> list[dict]:
         """Return ALL open orders including trigger (TP/SL) orders."""
@@ -185,12 +195,15 @@ class HyperliquidExchange:
         return positions
 
     def get_open_orders_for_symbol(self, symbol: str) -> list[dict]:
-        """Return open limit orders for a specific symbol."""
+        """Return open limit orders (excluding TP/SL triggers) for a specific symbol."""
         if self.config.paper_trade:
             return []
         try:
-            orders = self.info.open_orders(self.address)
-            return [o for o in orders if o.get("coin") == symbol]
+            orders = self.info.frontend_open_orders(self.address)
+            return [
+                o for o in orders
+                if o.get("coin") == symbol and not self._is_trigger_order(o)
+            ]
         except Exception as e:
             logger.error(f"Failed to get open orders for {symbol}: {e}")
             return []
@@ -203,7 +216,7 @@ class HyperliquidExchange:
             orders = self.info.frontend_open_orders(self.address)
             return [
                 o for o in orders
-                if o.get("coin") == symbol and o.get("orderType", "").startswith("Trigger")
+                if o.get("coin") == symbol and self._is_trigger_order(o)
             ]
         except Exception as e:
             logger.error(f"Failed to get trigger orders for {symbol}: {e}")
@@ -235,9 +248,23 @@ class HyperliquidExchange:
         return len(cancel_requests)
 
     def update_tp_sl_orders(self, quantity: float, side: str, tp_price: float, sl_price: float) -> dict:
-        """Cancel existing TP/SL triggers and place new ones at updated prices."""
+        """Cancel existing TP/SL triggers and place new ones at updated prices.
+
+        Placement is skipped unless the cancel verifiably cleared the old
+        triggers — placing on top of live ones stacks duplicate orders.
+        """
         symbol = self.config.hl_symbol
+        if self.config.paper_trade:
+            return self.place_tp_sl_orders(quantity, side, tp_price, sl_price)
+
         self.cancel_trigger_orders_for_symbol(symbol)
+        remaining = self.get_trigger_orders_for_symbol(symbol)
+        if remaining:
+            logger.warning(
+                f"[{symbol}] {len(remaining)} trigger orders still open after cancel — "
+                f"skipping TP/SL re-place to avoid duplicates"
+            )
+            return {"error": "cancel_incomplete", "remaining": len(remaining)}
         return self.place_tp_sl_orders(quantity, side, tp_price, sl_price)
 
     def cancel_orders_for_symbol(self, symbol: str) -> int:
