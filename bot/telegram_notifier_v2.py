@@ -2,7 +2,7 @@
 
 The legacy Telegram /closeall command trusts the trader's in-memory dictionaries.
 That is unsafe after restarts, failed syncs, or earlier versions that left orphan
-orders on Hyperliquid.  V2 treats the exchange as the source of truth.
+orders on Hyperliquid. V2 treats the exchange as the source of truth.
 """
 
 from __future__ import annotations
@@ -17,11 +17,26 @@ from bot.telegram_notifier import TelegramBot as BaseTelegramBot
 logger = logging.getLogger(__name__)
 
 
-def _managed_symbols(trader, exchange_positions: list[dict]) -> list[str]:
+def _account_order_symbols(exchange) -> set[str]:
+    """Discover symbols with live Hyperliquid orders, even if config changed.
+
+    Older bot versions may have left orders on a symbol that is no longer in
+    HL_SYMBOLS. The V2 emergency close must still find and clean those orders.
+    """
+    try:
+        if hasattr(exchange, "info") and hasattr(exchange, "address"):
+            orders = exchange.info.frontend_open_orders(exchange.address)
+            return {o.get("coin") for o in orders if o.get("coin")}
+    except Exception as exc:
+        logger.warning("Could not discover account-wide open-order symbols: %s", exc)
+    return set()
+
+
+def _managed_symbols(trader, exchange_positions: list[dict], exchange=None) -> list[str]:
     """Return every symbol the bot may need to flatten.
 
-    Include configured symbols, locally-known state, and exchange positions so
-    /closeall still works when local memory is stale or incomplete.
+    Include configured symbols, locally-known state, exchange positions, and
+    account-wide live orders so /closeall works even when local memory is stale.
     """
     symbols = set(trader._get_symbols())
     symbols.update(getattr(trader, "positions", {}).keys())
@@ -30,6 +45,8 @@ def _managed_symbols(trader, exchange_positions: list[dict]) -> list[str]:
         p.get("coin") for p in exchange_positions
         if p.get("coin")
     )
+    if exchange is not None:
+        symbols.update(_account_order_symbols(exchange))
     return sorted(symbols)
 
 
@@ -37,8 +54,8 @@ def _cancel_and_snapshot(exchange, symbol: str, attempts: int = 4) -> tuple[int,
     """Cancel all orders for a symbol and verify what remains.
 
     cancel_orders_for_symbol historically returned the number of attempted
-    cancellations even when some cancellations failed.  Never trust that
-    return value as proof.  Always read exchange state again.
+    cancellations even when some cancellations failed. Never trust that
+    return value as proof. Always read exchange state again.
     """
     exchange.switch_symbol(symbol)
     first_normal = exchange.get_open_orders_for_symbol(symbol)
@@ -65,7 +82,7 @@ def flatten_exchange_state(trader) -> dict:
     """Pause the bot and flatten actual Hyperliquid state for managed symbols.
 
     This intentionally does not rely on trader.positions or pending_orders as
-    the source of truth.  It queries Hyperliquid, cancels stale entries and
+    the source of truth. It queries Hyperliquid, cancels stale entries and
     triggers, closes the actual exchange size, then verifies both position and
     order state before reporting success.
     """
@@ -93,7 +110,7 @@ def flatten_exchange_state(trader) -> dict:
         result["failures"]["account"] = f"could not read positions: {exc}"
         return result
 
-    symbols = _managed_symbols(trader, exchange_positions)
+    symbols = _managed_symbols(trader, exchange_positions, exchange)
     primary = getattr(trader, "primary_symbol", trader.config.hl_symbol)
 
     for symbol in symbols:
@@ -217,7 +234,7 @@ class TelegramBot(BaseTelegramBot):
         force = bool(context.args and context.args[0].lower() == "force")
         if not force and not self.trader.config.paper_trade:
             exchange_positions = self.trader.exchange.get_all_positions()
-            symbols = _managed_symbols(self.trader, exchange_positions)
+            symbols = _managed_symbols(self.trader, exchange_positions, self.trader.exchange)
             dirty = []
             for sym in symbols:
                 self.trader.exchange.switch_symbol(sym)
