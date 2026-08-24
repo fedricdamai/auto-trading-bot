@@ -38,10 +38,10 @@ class Config:
     lookback_candles: int = int(os.getenv("LOOKBACK_CANDLES", "200"))
     min_touches: int = int(os.getenv("MIN_TOUCHES", "2"))
     level_tolerance_pct: float = float(os.getenv("LEVEL_TOLERANCE_PCT", "0.5"))
-    order_size: float = float(os.getenv("ORDER_SIZE", "2000"))
+    order_size: float = 2000.0
     target_profit_usd: float = 4.0
-    target_pnl_pct: float = float(os.getenv("TARGET_PNL_PCT", "2.5"))
-    max_loss_pct: float = float(os.getenv("MAX_LOSS_PCT", "1.5"))
+    target_pnl_pct: float = 2.5
+    max_loss_pct: float = 1.5
     check_interval: int = int(os.getenv("CHECK_INTERVAL", "5"))
     paper_trade: bool = os.getenv("PAPER_TRADE", "true").lower() == "true"
     log_level: str = os.getenv("LOG_LEVEL", "INFO")
