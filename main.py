@@ -2,8 +2,9 @@
 """Auto Trading Bot.
 
 Hyperliquid defaults to Trader V2:
-4h regime -> 1h structure -> 30m confirmation, with strict order cleanup and
-risk-sized positions. Set TRADER_VERSION=v1 for deliberate rollback.
+reaction-based 30m/1h support and resistance, trend as context, structural
+TP/SL, and strict one-family-per-symbol execution. Set TRADER_VERSION=v1 for
+deliberate rollback.
 """
 
 import logging
@@ -71,10 +72,10 @@ def build_exchange(config: Config):
 
 
 def build_trader(config: Config, exchange, notifier=None):
-    # V2 currently targets the Hyperliquid order lifecycle. Keep V1 available
-    # for rollback and for the generic ccxt adapter.
+    # Production V2 uses the strict grouped-order wrapper. V1 remains available
+    # for deliberate rollback and for the generic ccxt adapter.
     if config.exchange_backend == "hyperliquid" and config.trader_version == "v2":
-        from bot.trader_v2_continuous import Trader
+        from bot.trader_v2_safe import Trader
         return Trader(config, exchange, notifier)
 
     from bot.trader import Trader
@@ -95,6 +96,16 @@ def main():
     setup_logging(config.log_level)
     logger = logging.getLogger(__name__)
 
+    # A second live process can have completely separate in-memory pending
+    # state and submit duplicate entries. Refuse to run two V2 engines at once.
+    if config.exchange_backend == "hyperliquid" and config.trader_version == "v2":
+        from bot.runtime_lock import acquire_single_instance_lock
+        try:
+            acquire_single_instance_lock()
+        except RuntimeError as exc:
+            logger.critical(f"Trader V2 startup refused: {exc}")
+            raise SystemExit(2) from exc
+
     backend = config.exchange_backend.upper()
     symbol = config.hl_symbol if config.exchange_backend == "hyperliquid" else config.symbol
     mode = "PAPER" if config.paper_trade else "LIVE"
@@ -109,12 +120,13 @@ def main():
     logger.info(f"  Timeframe:   {config.timeframe}")
     if config.exchange_backend == "hyperliquid":
         if config.trader_version == "v2":
-            logger.info("  Strategy:    4h regime -> 1h structure -> 30m confirmation")
+            logger.info("  Strategy:    reaction S/R first, HTF trend as context")
+            logger.info("  Orders:      one grouped entry + reduce-only TP/SL per symbol")
             logger.info(f"  Leverage:    fixed {config.v2_leverage}x isolated")
             logger.info(f"  Risk/trade:  ${config.v2_risk_per_trade_usd:.2f}")
             logger.info(f"  Max notional:${config.v2_max_position_notional_usd:.2f}")
             logger.info(
-                f"  Decisions:   re-evaluate HTF history every "
+                f"  Decisions:   re-evaluate S/R history every "
                 f"{config.v2_signal_scan_interval_seconds}s"
             )
             logger.info(
@@ -146,7 +158,7 @@ def main():
         tg_log_handler.addFilter(_RuntimeNoiseFilter())
         logging.getLogger().addHandler(tg_log_handler)
         tg_bot.start_command_listener()
-        logger.info("Telegram commands active — /logs to control log streaming")
+        logger.info("Telegram commands active: /logs to control log streaming")
 
         # Proactive startup acknowledgement. V2 overrides this method with a
         # strategy-specific message; V1 keeps its legacy startup format.
