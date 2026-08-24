@@ -13,18 +13,34 @@ from bot.config import Config
 
 
 class _RuntimeNoiseFilter(logging.Filter):
-    """Keep polling/heartbeat noise out of the interactive console and Telegram.
+    """Keep infrastructure chatter out of the interactive console/Telegram.
 
-    Detailed heartbeat logs still go to bot.log. Strategy decisions, fills,
-    cancellations, warnings and errors remain visible.
+    Full detail still goes to bot.log. Strategy decisions, fills,
+    cancellations, warnings and meaningful errors remain visible.
     """
 
     def filter(self, record: logging.LogRecord) -> bool:
         message = record.getMessage()
-        if record.name.startswith("httpx"):
+        if record.name.startswith("httpx") or record.name.startswith("httpcore"):
             return False
         if message.startswith("V2 Tick:"):
             return False
+
+        # Multi-symbol scans switch the adapter repeatedly. These messages are
+        # useful in the file log but drown out actual strategy output onscreen.
+        if record.name == "bot.hyperliquid_exchange" and (
+            message.startswith("Switched symbol:")
+            or " szDecimals=" in message
+            or message.startswith("Leverage set to ")
+        ):
+            return False
+
+        # python-telegram-bot automatically retries transient polling read
+        # errors. Keep the full traceback in bot.log without flooding console
+        # or trying to forward the same transport failure back through Telegram.
+        if record.name.startswith("telegram.ext.Updater") and "polling" in message.lower():
+            return False
+
         return True
 
 
@@ -101,6 +117,10 @@ def main():
                 f"  Decisions:   re-evaluate HTF history every "
                 f"{config.v2_signal_scan_interval_seconds}s"
             )
+            logger.info(
+                f"  Heartbeat:   Telegram every "
+                f"{config.v2_heartbeat_interval_seconds // 60}m"
+            )
         else:
             logger.info(f"  Leverage:    dynamic {config.hl_leverage_min}x-{config.hl_leverage_max}x")
         if config.hl_multi_symbol:
@@ -127,6 +147,27 @@ def main():
         logging.getLogger().addHandler(tg_log_handler)
         tg_bot.start_command_listener()
         logger.info("Telegram commands active — /logs to control log streaming")
+
+        # Proactive startup acknowledgement. V2 overrides this method with a
+        # strategy-specific message; V1 keeps its legacy startup format.
+        if config.exchange_backend == "hyperliquid" and config.trader_version == "v2":
+            tg_bot.notify_startup(
+                symbol,
+                config.timeframe,
+                config.paper_trade,
+                leverage=config.v2_leverage,
+                mainnet=config.hl_mainnet,
+                scan_seconds=config.v2_signal_scan_interval_seconds,
+                heartbeat_seconds=config.v2_heartbeat_interval_seconds,
+            )
+        else:
+            tg_bot.notify_startup(
+                symbol,
+                config.timeframe,
+                config.paper_trade,
+                leverage=config.hl_leverage,
+                mainnet=config.hl_mainnet,
+            )
 
     trader.run_loop()
 
