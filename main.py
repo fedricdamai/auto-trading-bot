@@ -58,7 +58,7 @@ def build_trader(config: Config, exchange, notifier=None):
     # V2 currently targets the Hyperliquid order lifecycle. Keep V1 available
     # for rollback and for the generic ccxt adapter.
     if config.exchange_backend == "hyperliquid" and config.trader_version == "v2":
-        from bot.trader_v2 import Trader
+        from bot.trader_v2_continuous import Trader
         return Trader(config, exchange, notifier)
 
     from bot.trader import Trader
@@ -97,7 +97,10 @@ def main():
             logger.info(f"  Leverage:    fixed {config.v2_leverage}x isolated")
             logger.info(f"  Risk/trade:  ${config.v2_risk_per_trade_usd:.2f}")
             logger.info(f"  Max notional:${config.v2_max_position_notional_usd:.2f}")
-            logger.info("  Decisions:   once per newly closed 30m candle")
+            logger.info(
+                f"  Decisions:   re-evaluate HTF history every "
+                f"{config.v2_signal_scan_interval_seconds}s"
+            )
         else:
             logger.info(f"  Leverage:    dynamic {config.hl_leverage_min}x-{config.hl_leverage_max}x")
         if config.hl_multi_symbol:
