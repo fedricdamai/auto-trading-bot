@@ -7,6 +7,8 @@ User-required invariants:
   failed.
 - The signal's already-calculated TP/SL remain authoritative after fill.
 - Those exact signal levels are persisted so a restart can recover them.
+- For pre-persistence live trades, the latest grouped-order log can recover the
+  exact entry/TP/SL that was also shown in Telegram.
 - A protection failure blocks NEW entries for that symbol but keeps the live
   position and thesis intact.
 - The exchange-authoritative watchdog retries protection on every runtime tick
@@ -22,6 +24,7 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
+import re
 import time
 
 from bot.trader_v2 import PendingOrder
@@ -34,6 +37,12 @@ class Trader(GuardedTrader):
     """Guarded V2 trader that only repairs protection and never auto-flattens."""
 
     THESIS_STATE_FILE = Path("v2_trade_thesis.json")
+    BOT_LOG_FILE = Path("bot.log")
+    GROUPED_LOG_PATTERN = re.compile(
+        r"\[(?P<symbol>[A-Z0-9]+)\]\s+V2 GROUPED PENDING\s+"
+        r"(?P<side>LONG|SHORT)\s+entry=(?P<entry>[0-9.]+)\s+"
+        r"TP=(?P<tp>[0-9.]+)\s+SL=(?P<sl>[0-9.]+)"
+    )
 
     def __init__(self, config, exchange, notifier=None):
         super().__init__(config, exchange, notifier)
@@ -46,15 +55,53 @@ class Trader(GuardedTrader):
     # Exact signal thesis persistence
     # ------------------------------------------------------------------
 
-    def _load_trade_theses(self) -> dict[str, dict]:
+    def _recover_trade_theses_from_log(self) -> dict[str, dict]:
+        """Recover latest exact grouped levels written before persistence existed."""
+        recovered: dict[str, dict] = {}
         try:
-            if not self.THESIS_STATE_FILE.exists():
-                return {}
-            raw = json.loads(self.THESIS_STATE_FILE.read_text())
-            return raw if isinstance(raw, dict) else {}
+            if not self.BOT_LOG_FILE.exists():
+                return recovered
+            for line in self.BOT_LOG_FILE.read_text(errors="ignore").splitlines():
+                match = self.GROUPED_LOG_PATTERN.search(line)
+                if not match:
+                    continue
+                symbol = match.group("symbol")
+                side = match.group("side").lower()
+                entry = float(match.group("entry"))
+                recovered[symbol] = {
+                    "signal_id": f"{symbol}:log-recovered",
+                    "symbol": symbol,
+                    "side": side,
+                    "kind": "support" if side == "long" else "resistance",
+                    "level_price": entry,
+                    "entry_price": entry,
+                    "stop_loss": float(match.group("sl")),
+                    "take_profit": float(match.group("tp")),
+                    "strength": 0.0,
+                    "timeframes": [],
+                    "created_at": 0.0,
+                    "source": "bot.log",
+                }
+        except Exception as exc:
+            logger.warning(f"Could not recover V2 trade thesis from bot.log: {exc}")
+        return recovered
+
+    def _load_trade_theses(self) -> dict[str, dict]:
+        stored: dict[str, dict] = {}
+        try:
+            if self.THESIS_STATE_FILE.exists():
+                raw = json.loads(self.THESIS_STATE_FILE.read_text())
+                if isinstance(raw, dict):
+                    stored = raw
         except Exception as exc:
             logger.warning(f"Could not load V2 trade thesis state: {exc}")
-            return {}
+
+        # Merge only missing symbols from the latest grouped-order log. Persisted
+        # state always wins because it was written directly from the signal.
+        recovered = self._recover_trade_theses_from_log()
+        for symbol, thesis in recovered.items():
+            stored.setdefault(symbol, thesis)
+        return stored
 
     def _save_trade_theses(self):
         try:
@@ -77,6 +124,7 @@ class Trader(GuardedTrader):
             "strength": float(signal.strength),
             "timeframes": list(signal.timeframes or []),
             "created_at": float(signal.created_at),
+            "source": "signal",
         }
         self._save_trade_theses()
 
@@ -289,7 +337,7 @@ class Trader(GuardedTrader):
             pos.initial_sl = pos.stop_loss
             pos.initial_tp = pos.take_profit
             logger.warning(
-                f"[{symbol}] Startup restoring saved signal TP/SL: "
+                f"[{symbol}] Startup restoring saved/logged signal TP/SL: "
                 f"TP={pos.take_profit:.4f} SL={pos.stop_loss:.4f}"
             )
             self._repair_known_position(symbol, actual, pos)
