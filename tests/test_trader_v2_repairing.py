@@ -34,9 +34,14 @@ class FlakyProtectionExchange(GroupedFakeExchange):
         return super().place_market_close(quantity, side=side)
 
 
-def test_fill_protection_failure_never_market_closes_and_retries_exact_levels():
+def make_repairing_trader(ex, tmp_path):
+    Trader.THESIS_STATE_FILE = tmp_path / "v2_trade_thesis.json"
+    return Trader(make_config(), ex)
+
+
+def test_fill_protection_failure_never_market_closes_and_retries_exact_levels(tmp_path):
     ex = FlakyProtectionExchange()
-    trader = Trader(make_config(), ex)
+    trader = make_repairing_trader(ex, tmp_path)
     signal = make_signal()
 
     trader._place_signal(signal, ex.price)
@@ -82,9 +87,9 @@ def test_fill_protection_failure_never_market_closes_and_retries_exact_levels():
     )
 
 
-def test_known_live_position_stays_open_until_protection_repair_succeeds():
+def test_known_live_position_stays_open_until_protection_repair_succeeds(tmp_path):
     ex = FlakyProtectionExchange()
-    trader = Trader(make_config(), ex)
+    trader = make_repairing_trader(ex, tmp_path)
 
     ex.position = {
         "coin": "BTC",
@@ -137,3 +142,40 @@ def test_known_live_position_stays_open_until_protection_repair_succeeds():
     assert len(ex.triggers) == 2
     assert all(o["reduceOnly"] is True for o in ex.triggers)
     assert sorted(float(o["triggerPx"]) for o in ex.triggers) == [99.0, 103.0]
+
+
+def test_exact_signal_tp_sl_persist_and_restore_after_restart(tmp_path):
+    state_file = tmp_path / "v2_trade_thesis.json"
+    Trader.THESIS_STATE_FILE = state_file
+
+    ex = GroupedFakeExchange()
+    first = Trader(make_config(), ex)
+    signal = make_signal()
+    first._place_signal(signal, ex.price)
+    pending = first.pending_orders["BTC"]
+
+    assert state_file.exists()
+
+    # Simulate a process restart after the entry filled and grouped children
+    # disappeared. The new process has no in-memory pending/position objects.
+    ex.normal_orders = []
+    ex.triggers = []
+    ex.position = {
+        "coin": "BTC",
+        "size": pending.quantity,
+        "side": "long",
+        "entry_price": pending.price,
+        "unrealized_pnl": 0.0,
+    }
+
+    restarted = Trader(make_config(), ex)
+    restarted._recover_orphan_position("BTC", ex.position)
+
+    assert "BTC" in restarted.positions
+    assert restarted.positions["BTC"].take_profit == signal.take_profit
+    assert restarted.positions["BTC"].stop_loss == signal.stop_loss
+    assert len(ex.triggers) == 2
+    assert all(o["reduceOnly"] is True for o in ex.triggers)
+    assert sorted(float(o["triggerPx"]) for o in ex.triggers) == sorted(
+        [signal.stop_loss, signal.take_profit]
+    )
