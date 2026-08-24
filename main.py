@@ -10,7 +10,6 @@ import logging
 import sys
 
 from bot.config import Config
-from bot.telegram_notifier import TelegramBot
 
 
 def setup_logging(level: str):
@@ -41,6 +40,15 @@ def build_trader(config: Config, exchange, notifier=None):
 
     from bot.trader import Trader
     return Trader(config, exchange, notifier)
+
+
+def build_telegram_bot(config: Config):
+    """Use exchange-sourced emergency controls with Hyperliquid Trader V2."""
+    if config.exchange_backend == "hyperliquid" and config.trader_version == "v2":
+        from bot.telegram_notifier_v2 import TelegramBot
+    else:
+        from bot.telegram_notifier import TelegramBot
+    return TelegramBot(config.tg_bot_token, config.tg_chat_id, config.telegram_whitelist)
 
 
 def main():
@@ -80,7 +88,7 @@ def main():
 
     tg_bot = None
     if config.telegram_enabled:
-        tg_bot = TelegramBot(config.tg_bot_token, config.tg_chat_id, config.telegram_whitelist)
+        tg_bot = build_telegram_bot(config)
         logger.info("Telegram bot enabled")
 
     trader = build_trader(config, exchange, tg_bot)
