@@ -565,6 +565,32 @@ class Trader:
 
     # ── Limit order placement ────────────────────────────────────────
 
+    def _compute_order_size(self, entry_price: float, tp_price: float, leverage: int) -> float:
+        """Size the position so that hitting TP yields target_profit_usd.
+
+        Falls back to config.order_size when the TP is too close (would
+        require an unreasonably large position) or when target_profit_usd
+        is not set.  config.order_size always acts as the upper cap.
+        """
+        tp_move_pct = abs(tp_price - entry_price) / entry_price
+        if tp_move_pct <= 0:
+            return self.config.order_size
+
+        target = self.config.target_profit_usd
+        if target <= 0:
+            return self.config.order_size
+
+        needed = target / tp_move_pct
+        cap = self.config.order_size * self.learner.params.confidence_scale
+        size = min(needed, cap)
+        margin = size / leverage
+        logger.info(
+            f"Position sizing: TP move {tp_move_pct*100:.3f}% → "
+            f"need ${needed:.0f} notional for ${target:.0f} profit | "
+            f"using ${size:.0f} (margin ${margin:.1f} @ {leverage}x)"
+        )
+        return size
+
     def _place_limit_order(self, symbol: str, current_price: float,
                            level: Level, effective_strength: float,
                            leverage: int | None = None):
@@ -572,11 +598,11 @@ class Trader:
         self.config.hl_leverage = leverage
         if hasattr(self.exchange, '_set_leverage'):
             self.exchange._set_leverage()
-        order_size = self.config.order_size * self.learner.params.confidence_scale
         side = "long" if level.kind == "support" else "short"
         entry_price = level.price
 
         tpsl = self._compute_tp_sl(symbol, entry_price, side, leverage, level_price=level.price)
+        order_size = self._compute_order_size(entry_price, tpsl["tp_price"], leverage)
 
         try:
             if side == "long":
