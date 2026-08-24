@@ -57,17 +57,24 @@ class Trader(GuardedTrader):
             "and retrying TP/SL on subsequent ticks. NO automatic market close."
         )
 
+    def _clear_repair_flag(self, symbol: str, tp: float, sl: float, quantity: float):
+        if symbol in self.protection_repair_needed:
+            logger.info(
+                f"[{symbol}] PROTECTION REPAIRED using stored signal levels: "
+                f"TP={tp:.4f} SL={sl:.4f} qty={quantity}"
+            )
+        self.protection_repair_needed.pop(symbol, None)
+        self.protection_repair_last_attempt.pop(symbol, None)
+
     def _repair_known_position(self, symbol: str, actual: dict, pos) -> bool:
         ok = super()._repair_known_position(symbol, actual, pos)
         if ok:
-            if symbol in self.protection_repair_needed:
-                logger.info(
-                    f"[{symbol}] PROTECTION REPAIRED using original signal levels: "
-                    f"TP={pos.take_profit:.4f} SL={pos.stop_loss:.4f} "
-                    f"qty={actual['size']}"
-                )
-            self.protection_repair_needed.pop(symbol, None)
-            self.protection_repair_last_attempt.pop(symbol, None)
+            self._clear_repair_flag(
+                symbol,
+                float(pos.take_profit),
+                float(pos.stop_loss),
+                float(actual["size"]),
+            )
         else:
             self.protection_repair_last_attempt[symbol] = time.time()
         return ok
@@ -82,13 +89,31 @@ class Trader(GuardedTrader):
         failure hook above keeps this pending thesis alive so the next tick can
         retry rather than closing the position.
         """
-        return super()._on_order_filled(symbol, order, fill_price, fill_qty)
+        result = super()._on_order_filled(symbol, order, fill_price, fill_qty)
+        pos = self.positions.get(symbol)
+        if pos is not None:
+            self._clear_repair_flag(
+                symbol,
+                float(pos.take_profit),
+                float(pos.stop_loss),
+                float(pos.quantity),
+            )
+        return result
 
     def _recover_orphan_position(self, symbol: str, actual: dict) -> bool:
         ok = super()._recover_orphan_position(symbol, actual)
         if ok:
-            self.protection_repair_needed.pop(symbol, None)
-            self.protection_repair_last_attempt.pop(symbol, None)
+            pos = self.positions.get(symbol)
+            if pos is not None:
+                self._clear_repair_flag(
+                    symbol,
+                    float(pos.take_profit),
+                    float(pos.stop_loss),
+                    float(pos.quantity),
+                )
+            else:
+                self.protection_repair_needed.pop(symbol, None)
+                self.protection_repair_last_attempt.pop(symbol, None)
         else:
             self.protection_repair_last_attempt[symbol] = time.time()
         return ok
