@@ -2,67 +2,99 @@ import os
 from dataclasses import dataclass
 from dotenv import load_dotenv
 
+from bot.strategy_settings import STRATEGY
+
 load_dotenv()
 
 
 @dataclass
 class Config:
-    # Exchange backend: "ccxt" or "hyperliquid"
-    exchange_backend: str = os.getenv("EXCHANGE_BACKEND", "hyperliquid")
+    """Application configuration.
 
-    # ccxt settings (used when EXCHANGE_BACKEND=ccxt)
+    Environment variables are intentionally limited to secrets and deployment
+    switches. Trading logic and risk parameters live in strategy_settings.py so
+    they are versioned, reviewable, and tested with the code that uses them.
+    """
+
+    # Runtime / deployment switches
+    exchange_backend: str = os.getenv("EXCHANGE_BACKEND", "hyperliquid")
+    trader_version: str = os.getenv("TRADER_VERSION", "v2").lower()
+    paper_trade: bool = os.getenv("PAPER_TRADE", "true").lower() == "true"
+    log_level: str = os.getenv("LOG_LEVEL", "INFO")
+
+    # ccxt credentials / adapter settings
     exchange_id: str = os.getenv("EXCHANGE_ID", "binance")
     api_key: str = os.getenv("API_KEY", "")
     api_secret: str = os.getenv("API_SECRET", "")
     symbol: str = os.getenv("SYMBOL", "BTC/USDT")
 
-    # Hyperliquid settings (used when EXCHANGE_BACKEND=hyperliquid)
+    # Hyperliquid credentials / network only
     hl_wallet_address: str = os.getenv("HL_WALLET_ADDRESS", "")
     hl_private_key: str = os.getenv("HL_PRIVATE_KEY", "")
-    hl_symbol: str = os.getenv("HL_SYMBOL", "BTC")
     hl_mainnet: bool = os.getenv("HL_MAINNET", "false").lower() == "true"
 
-    # Dynamic leverage range (actual leverage per trade is computed from signal quality)
-    hl_leverage_min: int = int(os.getenv("HL_LEVERAGE_MIN", "3"))
-    hl_leverage_max: int = int(os.getenv("HL_LEVERAGE_MAX", "10"))
-    hl_leverage: int = 10  # current active leverage, set dynamically per trade
+    # Trading universe comes from version-controlled strategy settings.
+    hl_symbol: str = STRATEGY.primary_symbol
+    hl_multi_symbol: bool = True
+    hl_symbols: str = ",".join(STRATEGY.symbols)
+    hl_scan_top_n: int = 10
+    hl_max_positions: int = STRATEGY.max_positions
 
-    # Multi-symbol scanning
-    hl_multi_symbol: bool = os.getenv("HL_MULTI_SYMBOL", "true").lower() == "true"
-    hl_symbols: str = os.getenv("HL_SYMBOLS", "BTC,ETH,SOL,HYPE,BNB")
-    hl_scan_top_n: int = int(os.getenv("HL_SCAN_TOP_N", "10"))
-    hl_max_positions: int = int(os.getenv("HL_MAX_POSITIONS", "5"))
+    # General trading settings from source-controlled strategy configuration.
+    timeframe: str = STRATEGY.decision_timeframe
+    lookback_candles: int = STRATEGY.lookback_candles
+    min_touches: int = STRATEGY.min_touches
+    level_tolerance_pct: float = STRATEGY.level_tolerance_pct
+    order_size: float = STRATEGY.order_size_hard_cap_usd
+    check_interval: int = STRATEGY.check_interval_seconds
 
-    # Trading settings (timeframe is fixed at 5m for scalping; multi-TF analysis uses 1m/5m/15m/1h/4h/1d internally)
-    timeframe: str = "5m"
-    lookback_candles: int = int(os.getenv("LOOKBACK_CANDLES", "200"))
-    min_touches: int = int(os.getenv("MIN_TOUCHES", "2"))
-    level_tolerance_pct: float = float(os.getenv("LEVEL_TOLERANCE_PCT", "0.5"))
-    order_size: float = 2000.0
-    target_profit_usd: float = 4.0
-    target_pnl_pct: float = 2.5
-    max_loss_pct: float = 1.5
-    check_interval: int = int(os.getenv("CHECK_INTERVAL", "5"))
-    paper_trade: bool = os.getenv("PAPER_TRADE", "true").lower() == "true"
-    log_level: str = os.getenv("LOG_LEVEL", "INFO")
+    # V2 monitoring cadence. These are deliberately independent from the
+    # 30m/1h/4h candle timeframes used to calculate the strategy.
+    v2_signal_scan_interval_seconds: int = STRATEGY.signal_scan_interval_seconds
+    v2_heartbeat_interval_seconds: int = STRATEGY.heartbeat_interval_seconds
 
-    # TP/SL positioning around S/R zones
-    # SL sits this % beyond the level that justifies the trade (zone buffer)
-    sl_zone_buffer_pct: float = float(os.getenv("SL_ZONE_BUFFER_PCT", "0.25"))
-    # TP sits this % in front of the next opposing level
-    tp_zone_buffer_pct: float = float(os.getenv("TP_ZONE_BUFFER_PCT", "0.15"))
-    # Minimum reward-to-risk before a nearer level is skipped for a further one
-    min_risk_reward: float = float(os.getenv("MIN_RISK_REWARD", "1.5"))
-    # Only re-place exchange TP/SL triggers when a price moved at least this %
-    tp_sl_sync_min_change_pct: float = float(os.getenv("TP_SL_SYNC_MIN_CHANGE_PCT", "0.1"))
+    # V2 strategy / risk settings
+    hl_leverage_min: int = STRATEGY.leverage_min
+    hl_leverage_max: int = STRATEGY.leverage_max
+    hl_leverage: int = STRATEGY.leverage
+    v2_leverage: int = STRATEGY.leverage
 
-    # Limit order settings
-    order_ttl_hours: float = float(os.getenv("ORDER_TTL_HOURS", "2"))
-    level_refresh_seconds: int = int(os.getenv("LEVEL_REFRESH_SECONDS", "300"))
-    doji_check_seconds: int = int(os.getenv("DOJI_CHECK_SECONDS", "300"))
-    cooldown_seconds: int = int(os.getenv("COOLDOWN_SECONDS", "60"))
+    v2_risk_per_trade_usd: float = STRATEGY.risk_per_trade_usd
+    v2_max_position_notional_usd: float = STRATEGY.max_position_notional_usd
+    v2_min_position_notional_usd: float = STRATEGY.min_position_notional_usd
+    v2_max_margin_fraction: float = STRATEGY.max_margin_fraction
 
-    # Telegram notifications (optional)
+    v2_min_trend_confidence: float = STRATEGY.min_trend_confidence
+    v2_min_level_strength: float = STRATEGY.min_level_strength
+    v2_min_level_timeframes: int = STRATEGY.min_level_timeframes
+    v2_max_level_distance_pct: float = STRATEGY.max_level_distance_pct
+
+    v2_confirmation_zone_pct: float = STRATEGY.confirmation_zone_pct
+    v2_entry_pullback_atr: float = STRATEGY.entry_pullback_atr
+
+    v2_sl_atr_mult: float = STRATEGY.sl_atr_mult
+    v2_sl_zone_buffer_pct: float = STRATEGY.sl_zone_buffer_pct
+    v2_min_stop_distance_pct: float = STRATEGY.min_stop_distance_pct
+    v2_max_stop_distance_pct: float = STRATEGY.max_stop_distance_pct
+
+    v2_target_risk_reward: float = STRATEGY.target_risk_reward
+    v2_tp_zone_buffer_pct: float = STRATEGY.tp_zone_buffer_pct
+    v2_symbol_cooldown_minutes: float = STRATEGY.symbol_cooldown_minutes
+
+    # Legacy V1 compatibility. These are also code settings, not .env knobs.
+    target_profit_usd: float = STRATEGY.legacy_target_profit_usd
+    target_pnl_pct: float = STRATEGY.legacy_target_pnl_pct
+    max_loss_pct: float = STRATEGY.legacy_max_loss_pct
+    sl_zone_buffer_pct: float = STRATEGY.legacy_sl_zone_buffer_pct
+    tp_zone_buffer_pct: float = STRATEGY.legacy_tp_zone_buffer_pct
+    min_risk_reward: float = STRATEGY.legacy_min_risk_reward
+    tp_sl_sync_min_change_pct: float = STRATEGY.legacy_tp_sl_sync_min_change_pct
+    order_ttl_hours: float = STRATEGY.legacy_order_ttl_hours
+    level_refresh_seconds: int = STRATEGY.legacy_level_refresh_seconds
+    doji_check_seconds: int = STRATEGY.legacy_doji_check_seconds
+    cooldown_seconds: int = STRATEGY.legacy_cooldown_seconds
+
+    # Telegram credentials
     tg_bot_token: str = os.getenv("TG_BOT_TOKEN", "")
     tg_chat_id: str = os.getenv("TG_CHAT_ID", "")
     tg_allowed_users: str = os.getenv("TG_ALLOWED_USERS", "")

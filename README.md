@@ -1,71 +1,156 @@
-# Auto Trading Bot - Support & Resistance Levels
+# Auto Trading Bot
 
-An automated trading bot that detects and scores support/resistance levels from 4H candle data, places limit orders at the strongest levels, and manages positions with dynamic risk parameters.
+Automated support/resistance trading bot with a conservative higher-timeframe Hyperliquid engine focused on fewer, higher-quality entries and strict order cleanup.
 
-Supports **Hyperliquid** (decentralized perps, 1x leverage) and **ccxt** exchanges (Binance, etc.), with optional **Telegram** alerts.
+## Strategy
 
-## How it works
+The decision stack is intentionally higher timeframe:
 
-1. **Detects levels** from 4H candles using swing-point analysis, wick detection, and price clustering
-2. **Scores each level (0-100)** based on touch count, volume, recency, and rejection strength
-3. **Places limit buy orders** at the strongest levels (support bounce + resistance breakout)
-4. **Dynamic risk**: tighter SL on stronger levels, minimum 2:1 reward-to-risk
-5. **Self-cleans**: cancels stale orders and orders at invalidated levels
-6. **Telegram alerts** on every trade, exit, and error (optional)
+```text
+4h market regime
+        ↓
+1h + 4h trend agreement
+        ↓
+30m / 1h / 4h support-resistance
+        ↓
+30m touch + rejection confirmation
+        ↓
+pullback limit entry
+        ↓
+structural ATR stop + risk-sized position
+```
+
+There are no 1m or 5m inputs in the current strategy.
+
+### Entry lifecycle
+
+1. A completed 30m candle must reject a qualifying level.
+2. A pullback limit order is armed after confirmation.
+3. The entry is valid only until the next 30m candle boundary.
+4. If it remains unfilled, the exact entry is cancelled and exchange state is verified.
+5. A new or opposite signal cannot replace it until the previous order family is confirmed clean.
+6. TP and SL triggers are created only after the exchange confirms that the entry actually filled.
+
+### Risk model
+
+Stops are based on market structure and volatility, not `max_loss_pct / leverage`.
+
+```text
+position_notional = risk_per_trade_usd / stop_distance_pct
+```
+
+The result is capped by maximum notional and a maximum fraction of account value allocated as isolated margin.
+
+Default validation settings:
+
+| Setting | Default |
+|---|---:|
+| Entry timeframe | 30m |
+| Trend timeframes | 1h + 4h |
+| Fixed leverage | 3x isolated |
+| Risk per trade | $4 |
+| Max notional | $500 |
+| Minimum stop distance | 0.60% |
+| Maximum stop distance | 2.50% |
+| Target reward/risk | 1.50R |
+| Pending-entry lifetime | one 30m candle |
+| Symbol cooldown after exit | 30 minutes |
+
+These are starting parameters for validation, not promises of profitability.
+
+### Safety behavior
+
+- one pending entry/position family per symbol
+- no TP/SL triggers before entry fill
+- exchange-verified cancellation before replacement signals
+- cancel/fill race handling
+- stale-order cleanup on startup
+- exactly one TP and one SL expected for an open position
+- periodic exchange-side TP/SL verification
+- full-position TP/SL sizing if exchange size changes
+- per-symbol circuit breaker when exchange state cannot be reconciled
+- `/closeall` and `/stop` use exchange truth rather than only local memory
+- adaptive strategy learning does not modify live risk parameters
+
+## Configuration model
+
+Trading parameters are **not stored in `.env`**.
+
+All strategy, signal-quality, timeframe, leverage, stop, target and position-sizing parameters live in:
+
+```text
+bot/strategy_settings.py
+```
+
+That file is source-controlled so a trading-logic change is visible in Git history, reviewed together with the code, and covered by tests.
+
+`.env` is intentionally restricted to credentials and deployment/runtime switches:
+
+```env
+EXCHANGE_BACKEND=hyperliquid
+TRADER_VERSION=v2
+PAPER_TRADE=true
+LOG_LEVEL=INFO
+
+HL_WALLET_ADDRESS=0xYourWalletAddress
+HL_PRIVATE_KEY=your_private_key_here
+HL_MAINNET=false
+
+TG_BOT_TOKEN=
+TG_CHAT_ID=
+TG_ALLOWED_USERS=
+```
+
+`HL_MAINNET=false` means the bot reads Hyperliquid testnet. Keep this during isolated validation. `PAPER_TRADE=true` means the bot does not submit real exchange orders.
+
+Never commit a real `.env` file or private key.
 
 ## Setup
 
 ```bash
 pip install -r requirements.txt
 cp .env.example .env
-# Edit .env with your settings
 ```
 
-### Hyperliquid setup
+For initial isolated testing keep:
 
-1. Get your wallet address and private key (MetaMask or similar)
-2. Set `EXCHANGE_BACKEND=hyperliquid` in `.env`
-3. Set `HL_WALLET_ADDRESS` and `HL_PRIVATE_KEY`
-4. Start with `HL_MAINNET=false` (testnet) and `PAPER_TRADE=true`
-
-### Telegram setup (optional)
-
-1. Message [@BotFather](https://t.me/BotFather) on Telegram, create a bot, copy the token
-2. Message [@userinfobot](https://t.me/userinfobot) to get your chat ID
-3. Set `TG_BOT_TOKEN` and `TG_CHAT_ID` in `.env`
-
-## Configuration
-
-All settings are in `.env` (see `.env.example`):
-
-| Variable | Description | Default |
-|---|---|---|
-| `EXCHANGE_BACKEND` | `hyperliquid` or `ccxt` | `hyperliquid` |
-| `HL_SYMBOL` | Hyperliquid asset name | `BTC` |
-| `HL_LEVERAGE` | Leverage multiplier | `1` |
-| `TIMEFRAME` | Candle timeframe | `4h` |
-| `ORDER_SIZE` | Buy size in quote currency | `50` |
-| `MAX_OPEN_ORDERS` | Max simultaneous limit orders | `5` |
-| `ORDER_TTL_HOURS` | Cancel unfilled orders after | `24` |
-| `PAPER_TRADE` | Simulate orders | `true` |
-
-## Deploy on a VPS
-
-```bash
-git clone https://github.com/fedricdamai/auto-trading-bot.git
-cd auto-trading-bot
-bash setup.sh
-nano .env       # fill in your keys
-sudo systemctl start tradingbot
-journalctl -u tradingbot -f
+```env
+TRADER_VERSION=v2
+PAPER_TRADE=true
+HL_MAINNET=false
 ```
+
+Do not switch directly from an older live process with resting orders. Flatten positions and cancel legacy orders first.
 
 ## Tests
 
 ```bash
-pytest tests/ -v
+python -m pytest -q
 ```
+
+Tests cover structural stops, rejection confirmation, opposing-level filtering, fixed-risk sizing, pending-entry expiry, pre-fill trigger prevention, cancellation/fill races and exchange-sourced `/closeall` cleanup.
+
+## VPS validation
+
+```bash
+git fetch origin
+git checkout fix/trading-logic-v2
+git pull --ff-only origin fix/trading-logic-v2
+python -m pytest -q
+```
+
+Start manually in paper/testnet mode first and inspect decision logs before returning the service to systemd.
+
+## Rollback
+
+The previous engine remains temporarily available for comparison through:
+
+```env
+TRADER_VERSION=v1
+```
+
+The version switch is a deployment rollback mechanism, not a strategy parameter.
 
 ## Disclaimer
 
-This bot is for educational purposes. Trading involves risk. Use paper trading mode first. Never trade with money you can't afford to lose.
+Trading involves substantial risk. Validate order behavior in paper mode and Hyperliquid testnet before using mainnet capital.
