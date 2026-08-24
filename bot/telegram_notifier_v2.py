@@ -3,6 +3,9 @@
 The legacy Telegram /closeall command trusts the trader's in-memory dictionaries.
 That is unsafe after restarts, failed syncs, or earlier versions that left orphan
 orders on Hyperliquid. V2 treats the exchange as the source of truth.
+
+V2 also sends a periodic health digest so long periods without a qualifying
+setup do not look like a dead bot.
 """
 
 from __future__ import annotations
@@ -180,6 +183,70 @@ def flatten_exchange_state(trader) -> dict:
 
 class TelegramBot(BaseTelegramBot):
     """V2 Telegram bot whose emergency controls use exchange truth."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._last_send_error: str | None = None
+
+    def send(self, message: str):
+        """Best-effort Telegram delivery that can never stop the trading loop."""
+        try:
+            super().send(message)
+            self._last_send_error = None
+            return True
+        except Exception as exc:
+            # Do not log here. The root logger itself forwards to Telegram, so
+            # logging a Telegram send failure from this method can recurse.
+            self._last_send_error = f"{type(exc).__name__}: {exc}"
+            return False
+
+    def notify_startup(
+        self,
+        symbol: str,
+        timeframe: str,
+        paper: bool,
+        leverage: int = 1,
+        mainnet: bool = False,
+        scan_seconds: int = 60,
+        heartbeat_seconds: int = 600,
+    ):
+        if paper:
+            mode = "PAPER"
+        else:
+            mode = "LIVE MAINNET" if mainnet else "LIVE TESTNET"
+        symbols = "BTC, ETH, SOL, HYPE, BNB"
+        self.send(
+            f"<b>Trading Bot Online [{mode}]</b>\n"
+            f"Engine: <code>V2</code>\n"
+            f"Universe: <code>{symbols}</code>\n"
+            f"Strategy: <code>4h + 1h regime / 30m-4h structure</code>\n"
+            f"Leverage: <code>{leverage}x isolated</code>\n"
+            f"HTF scan: <code>every {scan_seconds}s</code>\n"
+            f"Heartbeat: <code>every {max(1, heartbeat_seconds // 60)}m</code>\n\n"
+            "I will message even when no setup qualifies so you can verify the bot is alive."
+        )
+
+    def notify_heartbeat(self, snapshot: dict):
+        state = "PAUSED" if snapshot.get("paused") else "RUNNING"
+        rows = snapshot.get("rows", [])
+        lines = []
+        for row in rows:
+            symbol = html.escape(str(row.get("symbol", "?")))
+            regime = html.escape(str(row.get("regime", "unknown")))
+            status = html.escape(str(row.get("status", "no setup")))
+            lines.append(f"<code>{symbol}</code> {regime} | {status}")
+
+        body = "\n".join(lines) or "No symbol data yet."
+        ok = self.send(
+            f"<b>Bot Heartbeat [{html.escape(str(snapshot.get('mode', '?')))}]</b>\n"
+            f"Status: <code>{state}</code> | "
+            f"Positions: <code>{snapshot.get('positions', 0)}</code> | "
+            f"Pending: <code>{snapshot.get('pending', 0)}</code> | "
+            f"Blocked: <code>{snapshot.get('blocked', 0)}</code>\n"
+            f"Scanning HTF history every <code>{snapshot.get('scan_interval_seconds', '?')}s</code>\n\n"
+            f"{body}"
+        )
+        return bool(ok)
 
     async def _cmd_closeall(self, update, context):
         if not self._is_authorized(update):
