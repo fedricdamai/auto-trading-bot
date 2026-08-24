@@ -5,6 +5,15 @@ from bot.trader_v2_continuous import Trader
 from tests.test_trader_v2 import FakeExchange, make_config, make_signal
 
 
+class FakeNotifier:
+    def __init__(self):
+        self.heartbeats = []
+
+    def notify_heartbeat(self, snapshot):
+        self.heartbeats.append(snapshot)
+        return True
+
+
 def test_signal_scan_runs_between_30m_boundaries():
     ex = FakeExchange()
     config = make_config()
@@ -84,3 +93,54 @@ def test_pending_limit_survives_when_same_historical_thesis_is_still_valid(monke
 
     assert "BTC" in trader.pending_orders
     assert len(ex.normal_orders) == 1
+
+
+def test_heartbeat_is_sent_after_a_completed_scan():
+    ex = FakeExchange()
+    config = make_config()
+    config.v2_heartbeat_interval_seconds = 600
+    notifier = FakeNotifier()
+    trader = Trader(config, ex, notifier=notifier)
+
+    now = time.time()
+    trader._last_scan_completed_at = now
+    trader.last_trend_bias["BTC"] = Regime("bullish", 100.0, {})
+
+    trader._maybe_send_heartbeat(now)
+
+    assert len(notifier.heartbeats) == 1
+    snapshot = notifier.heartbeats[0]
+    assert snapshot["mode"] == "LIVE TESTNET"
+    assert snapshot["positions"] == 0
+    assert snapshot["pending"] == 0
+    assert snapshot["rows"][0]["symbol"] == "BTC"
+    assert "bullish 100%" in snapshot["rows"][0]["regime"]
+
+
+def test_heartbeat_is_throttled_between_intervals():
+    ex = FakeExchange()
+    config = make_config()
+    config.v2_heartbeat_interval_seconds = 600
+    notifier = FakeNotifier()
+    trader = Trader(config, ex, notifier=notifier)
+
+    now = time.time()
+    trader._last_scan_completed_at = now
+    trader.last_trend_bias["BTC"] = Regime("neutral", 0.0, {})
+
+    trader._maybe_send_heartbeat(now)
+    trader._maybe_send_heartbeat(now + 60)
+
+    assert len(notifier.heartbeats) == 1
+
+
+def test_heartbeat_explains_idle_directional_symbol():
+    ex = FakeExchange()
+    config = make_config()
+    trader = Trader(config, ex)
+    trader.last_trend_bias["BTC"] = Regime("bullish", 100.0, {})
+    trader.known_levels["BTC"] = {}
+
+    reason = trader._describe_idle_symbol("BTC")
+
+    assert reason == "no qualifying support"
