@@ -36,6 +36,7 @@ class FlakyProtectionExchange(GroupedFakeExchange):
 
 def make_repairing_trader(ex, tmp_path):
     Trader.THESIS_STATE_FILE = tmp_path / "v2_trade_thesis.json"
+    Trader.BOT_LOG_FILE = tmp_path / "bot.log"
     return Trader(make_config(), ex)
 
 
@@ -147,6 +148,7 @@ def test_known_live_position_stays_open_until_protection_repair_succeeds(tmp_pat
 def test_exact_signal_tp_sl_persist_and_restore_after_restart(tmp_path):
     state_file = tmp_path / "v2_trade_thesis.json"
     Trader.THESIS_STATE_FILE = state_file
+    Trader.BOT_LOG_FILE = tmp_path / "bot.log"
 
     ex = GroupedFakeExchange()
     first = Trader(make_config(), ex)
@@ -179,3 +181,37 @@ def test_exact_signal_tp_sl_persist_and_restore_after_restart(tmp_path):
     assert sorted(float(o["triggerPx"]) for o in ex.triggers) == sorted(
         [signal.stop_loss, signal.take_profit]
     )
+
+
+def test_pre_persistence_live_trade_recovers_exact_levels_from_bot_log(tmp_path):
+    Trader.THESIS_STATE_FILE = tmp_path / "v2_trade_thesis.json"
+    Trader.BOT_LOG_FILE = tmp_path / "bot.log"
+    Trader.BOT_LOG_FILE.write_text(
+        "2026-08-25 01:13:10 [INFO] bot.trader_v2_safe: "
+        "[SOL] V2 GROUPED PENDING SHORT entry=96.2520 TP=94.8000 SL=97.1000 RR=1.75\n"
+    )
+
+    cfg = make_config()
+    cfg.hl_symbol = "SOL"
+    cfg.hl_symbols = "SOL"
+    ex = GroupedFakeExchange()
+    ex.symbol = "SOL"
+    ex.position = {
+        "coin": "SOL",
+        "size": 5.19,
+        "side": "short",
+        "entry_price": 96.252,
+        "unrealized_pnl": 0.0,
+    }
+    ex.normal_orders = []
+    ex.triggers = []
+
+    trader = Trader(cfg, ex)
+    trader._recover_orphan_position("SOL", ex.position)
+
+    assert "SOL" in trader.positions
+    assert trader.positions["SOL"].take_profit == 94.8
+    assert trader.positions["SOL"].stop_loss == 97.1
+    assert len(ex.triggers) == 2
+    assert all(o["reduceOnly"] is True for o in ex.triggers)
+    assert sorted(float(o["triggerPx"]) for o in ex.triggers) == [94.8, 97.1]
