@@ -12,15 +12,38 @@ import sys
 from bot.config import Config
 
 
+class _RuntimeNoiseFilter(logging.Filter):
+    """Keep polling/heartbeat noise out of the interactive console and Telegram.
+
+    Detailed heartbeat logs still go to bot.log. Strategy decisions, fills,
+    cancellations, warnings and errors remain visible.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
+        if record.name.startswith("httpx"):
+            return False
+        if message.startswith("V2 Tick:"):
+            return False
+        return True
+
+
 def setup_logging(level: str):
+    console = logging.StreamHandler(sys.stdout)
+    console.addFilter(_RuntimeNoiseFilter())
+
+    file_handler = logging.FileHandler("bot.log")
+
     logging.basicConfig(
         level=getattr(logging, level.upper(), logging.INFO),
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        handlers=[
-            logging.StreamHandler(sys.stdout),
-            logging.FileHandler("bot.log"),
-        ],
+        handlers=[console, file_handler],
     )
+
+    # Third-party polling libraries are extremely chatty at INFO. Keep them at
+    # warning level globally. This does not hide bot strategy INFO messages.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
 def build_exchange(config: Config):
@@ -74,6 +97,7 @@ def main():
             logger.info(f"  Leverage:    fixed {config.v2_leverage}x isolated")
             logger.info(f"  Risk/trade:  ${config.v2_risk_per_trade_usd:.2f}")
             logger.info(f"  Max notional:${config.v2_max_position_notional_usd:.2f}")
+            logger.info("  Decisions:   once per newly closed 30m candle")
         else:
             logger.info(f"  Leverage:    dynamic {config.hl_leverage_min}x-{config.hl_leverage_max}x")
         if config.hl_multi_symbol:
@@ -96,6 +120,7 @@ def main():
     if tg_bot:
         tg_bot.set_trader(trader)
         tg_log_handler = tg_bot.get_log_handler()
+        tg_log_handler.addFilter(_RuntimeNoiseFilter())
         logging.getLogger().addHandler(tg_log_handler)
         tg_bot.start_command_listener()
         logger.info("Telegram commands active — /logs to control log streaming")
