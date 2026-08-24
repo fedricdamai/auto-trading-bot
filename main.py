@@ -3,8 +3,8 @@
 
 Hyperliquid defaults to Trader V2:
 reaction-based 30m/1h support and resistance, trend as context, structural
-TP/SL, and strict one-family-per-symbol execution. Set TRADER_VERSION=v1 for
-deliberate rollback.
+TP/SL, strict one-family-per-symbol execution, and a live position protection
+watchdog. Set TRADER_VERSION=v1 for deliberate rollback.
 """
 
 import logging
@@ -72,10 +72,11 @@ def build_exchange(config: Config):
 
 
 def build_trader(config: Config, exchange, notifier=None):
-    # Production V2 uses the strict grouped-order wrapper. V1 remains available
-    # for deliberate rollback and for the generic ccxt adapter.
+    # Production V2 uses grouped entry families plus an exchange-authoritative
+    # protection watchdog. V1 remains available for deliberate rollback and for
+    # the generic ccxt adapter.
     if config.exchange_backend == "hyperliquid" and config.trader_version == "v2":
-        from bot.trader_v2_safe import Trader
+        from bot.trader_v2_guarded import Trader
         return Trader(config, exchange, notifier)
 
     from bot.trader import Trader
@@ -122,6 +123,7 @@ def main():
         if config.trader_version == "v2":
             logger.info("  Strategy:    reaction S/R first, HTF trend as context")
             logger.info("  Orders:      one grouped entry + reduce-only TP/SL per symbol")
+            logger.info("  Protection:  exchange watchdog every runtime tick")
             logger.info(f"  Leverage:    fixed {config.v2_leverage}x isolated")
             logger.info(f"  Risk/trade:  ${config.v2_risk_per_trade_usd:.2f}")
             logger.info(f"  Max notional:${config.v2_max_position_notional_usd:.2f}")
