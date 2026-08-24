@@ -24,6 +24,10 @@ class StrategySettings:
     check_interval_seconds: int = 5
     signal_scan_interval_seconds: int = 60
 
+    # Telegram heartbeat is intentionally much slower than the market scan so
+    # "no trade" periods still prove the bot is alive without spamming chat.
+    heartbeat_interval_seconds: int = 600
+
     # Higher-timeframe strategy
     decision_timeframe: str = "30m"
     lookback_candles: int = 200
