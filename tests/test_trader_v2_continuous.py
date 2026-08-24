@@ -14,14 +14,29 @@ class FakeNotifier:
         return True
 
 
+class DelayedTriggerExchange(FakeExchange):
+    def __init__(self):
+        super().__init__()
+        self.trigger_reads_hidden = 0
+
+    def place_tp_sl_orders(self, quantity, side, tp_price, sl_price):
+        result = super().place_tp_sl_orders(quantity, side, tp_price, sl_price)
+        self.trigger_reads_hidden = 3
+        return result
+
+    def get_trigger_orders_for_symbol(self, symbol):
+        if self.trigger_reads_hidden > 0:
+            self.trigger_reads_hidden -= 1
+            return []
+        return list(self.triggers)
+
+
 def test_signal_scan_runs_between_30m_boundaries():
     ex = FakeExchange()
     config = make_config()
     config.v2_signal_scan_interval_seconds = 60
     trader = Trader(config, ex)
 
-    # Avoid startup work and make the base Trader believe the current 30m
-    # boundary has already been processed.
     now = time.time()
     trader._synced = True
     trader._last_signal_bucket = int(now // (30 * 60))
@@ -30,13 +45,14 @@ def test_signal_scan_runs_between_30m_boundaries():
     calls = []
     trader._revalidate_pending_signals = lambda ts: calls.append(("revalidate", ts))
     trader._on_new_30m_candle = lambda ts: calls.append(("scan", ts))
+    trader._reconcile_untracked_exchange_positions = lambda: None
 
     trader.run_once()
 
     assert [name for name, _ in calls] == ["revalidate", "scan"]
 
 
-def test_signal_scan_does_not_run_every_five_second_tick():
+def test_signal_scan_does_not_run_every_one_second_tick():
     ex = FakeExchange()
     config = make_config()
     config.v2_signal_scan_interval_seconds = 60
@@ -50,6 +66,7 @@ def test_signal_scan_does_not_run_every_five_second_tick():
     calls = []
     trader._revalidate_pending_signals = lambda ts: calls.append("revalidate")
     trader._on_new_30m_candle = lambda ts: calls.append("scan")
+    trader._reconcile_untracked_exchange_positions = lambda: None
 
     trader.run_once()
 
@@ -76,7 +93,7 @@ def test_pending_limit_is_cancelled_when_fresh_scan_invalidates(monkeypatch):
     assert ex.normal_orders == []
 
 
-def test_pending_limit_survives_when_same_historical_thesis_is_still_valid(monkeypatch):
+def test_pending_limit_survives_when_same_sr_thesis_is_still_valid(monkeypatch):
     ex = FakeExchange()
     config = make_config()
     trader = Trader(config, ex)
@@ -93,6 +110,48 @@ def test_pending_limit_survives_when_same_historical_thesis_is_still_valid(monke
 
     assert "BTC" in trader.pending_orders
     assert len(ex.normal_orders) == 1
+
+
+def test_disappeared_entry_waits_for_position_state_propagation():
+    ex = FakeExchange()
+    config = make_config()
+    trader = Trader(config, ex)
+    signal = make_signal()
+    trader._place_signal(signal, ex.price)
+    pending = trader.pending_orders["BTC"]
+
+    # Open order disappears first, but user_state has not reflected the fill yet.
+    ex.normal_orders = []
+    trader._check_pending_order("BTC", ex.price, time.time())
+    assert "BTC" in trader.pending_orders
+
+    # One tick later the exchange position becomes visible. It must be protected.
+    ex.position = {
+        "coin": "BTC",
+        "size": pending.quantity,
+        "side": "long",
+        "entry_price": pending.price,
+        "unrealized_pnl": 0.0,
+    }
+    trader._check_pending_order("BTC", ex.price, time.time() + 1)
+
+    assert "BTC" not in trader.pending_orders
+    assert "BTC" in trader.positions
+    assert len(ex.triggers) == 2
+
+
+def test_tp_sl_verification_waits_for_exchange_visibility():
+    ex = DelayedTriggerExchange()
+    config = make_config()
+    trader = Trader(config, ex)
+
+    ok, oids = trader._replace_protection(
+        "BTC", quantity=1.0, side="long", tp=105.0, sl=95.0
+    )
+
+    assert ok is True
+    assert len(oids) == 2
+    assert len(ex.triggers) == 2
 
 
 def test_heartbeat_is_sent_after_a_completed_scan():
@@ -134,7 +193,7 @@ def test_heartbeat_is_throttled_between_intervals():
     assert len(notifier.heartbeats) == 1
 
 
-def test_heartbeat_explains_idle_directional_symbol():
+def test_heartbeat_explains_when_no_reaction_levels_exist():
     ex = FakeExchange()
     config = make_config()
     trader = Trader(config, ex)
@@ -143,4 +202,4 @@ def test_heartbeat_explains_idle_directional_symbol():
 
     reason = trader._describe_idle_symbol("BTC")
 
-    assert reason == "no qualifying support"
+    assert reason == "no validated 30m/1h S/R"
