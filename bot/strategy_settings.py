@@ -17,7 +17,12 @@ class StrategySettings:
     primary_symbol: str = "BTC"
     symbols: tuple[str, ...] = ("BTC", "ETH", "SOL", "HYPE", "BNB")
     max_positions: int = 5
+
+    # Exchange state is managed every 5 seconds. Historical trade setups are
+    # re-evaluated every 60 seconds. This is intentionally independent from the
+    # 30m/1h/4h candle timeframes used by the strategy itself.
     check_interval_seconds: int = 5
+    signal_scan_interval_seconds: int = 60
 
     # Higher-timeframe strategy
     decision_timeframe: str = "30m"
