@@ -39,7 +39,7 @@ class Config:
     min_touches: int = int(os.getenv("MIN_TOUCHES", "2"))
     level_tolerance_pct: float = float(os.getenv("LEVEL_TOLERANCE_PCT", "0.5"))
     order_size: float = float(os.getenv("ORDER_SIZE", "2000"))
-    target_profit_usd: float = float(os.getenv("TARGET_PROFIT_USD", "4.0"))
+    target_profit_usd: float = 4.0
     target_pnl_pct: float = float(os.getenv("TARGET_PNL_PCT", "2.5"))
     max_loss_pct: float = float(os.getenv("MAX_LOSS_PCT", "1.5"))
     check_interval: int = int(os.getenv("CHECK_INTERVAL", "5"))
