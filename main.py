@@ -27,8 +27,6 @@ class _RuntimeNoiseFilter(logging.Filter):
         if message.startswith("V2 Tick:"):
             return False
 
-        # Multi-symbol scans switch the adapter repeatedly. These messages are
-        # useful in the file log but drown out actual strategy output onscreen.
         if record.name == "bot.hyperliquid_exchange" and (
             message.startswith("Switched symbol:")
             or " szDecimals=" in message
@@ -36,9 +34,6 @@ class _RuntimeNoiseFilter(logging.Filter):
         ):
             return False
 
-        # python-telegram-bot automatically retries transient polling read
-        # errors. Keep the full traceback in bot.log without flooding console
-        # or trying to forward the same transport failure back through Telegram.
         if record.name.startswith("telegram.ext.Updater") and "polling" in message.lower():
             return False
 
@@ -70,10 +65,10 @@ def build_exchange(config: Config):
 
 
 def build_trader(config: Config, exchange, notifier=None):
-    # Production V2 keeps the repair-only execution policy and adds one stable
-    # audit ID across trigger, order, fill, protection and final result.
+    # Production V2 keeps one immutable identity for each active symbol until
+    # that trade lifecycle ends.
     if config.exchange_backend == "hyperliquid" and config.trader_version == "v2":
-        from bot.trader_v2_tracked import Trader
+        from bot.trader_v2_production import Trader
         return Trader(config, exchange, notifier)
 
     from bot.trader import Trader
@@ -94,8 +89,6 @@ def main():
     setup_logging(config.log_level)
     logger = logging.getLogger(__name__)
 
-    # A second live process can have completely separate in-memory pending
-    # state and submit duplicate entries. Refuse to run two V2 engines at once.
     if config.exchange_backend == "hyperliquid" and config.trader_version == "v2":
         from bot.runtime_lock import acquire_single_instance_lock
         try:
