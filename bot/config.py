@@ -48,6 +48,10 @@ class Config:
     order_size: float = STRATEGY.order_size_hard_cap_usd
     check_interval: int = STRATEGY.check_interval_seconds
 
+    # V2 signal evaluation cadence. This is deliberately independent from the
+    # 30m/1h/4h candle timeframes used to calculate the strategy.
+    v2_signal_scan_interval_seconds: int = STRATEGY.signal_scan_interval_seconds
+
     # V2 strategy / risk settings
     hl_leverage_min: int = STRATEGY.leverage_min
     hl_leverage_max: int = STRATEGY.leverage_max
